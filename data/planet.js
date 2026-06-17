@@ -2,14 +2,14 @@
    Data only (no Three types), mirroring data/materials.js. Material id 0 is reserved for AIR
    in the voxel grid; palette materials map to ids 1..N in order. */
 
-export const FREQ = 48;       // icosphere subdivision frequency → 10·FREQ²+2 = 23,042 columns
+export const FREQ = 75;       // icosphere subdivision frequency → 10·FREQ²+2 = 56,252 columns
 export const LAYERS = 32;     // radial voxel shells per column (build ceiling)
 export const CORE_L = 4;      // solid core boundary layer (below this is always solid core)
 export const SEA_L = 12;      // default sea level layer
 
 // ---- world scale (single source of truth; imported by planet-mesh.js + earth.js) ----
 export const R = 10;          // reference radius (sea level sits here)
-export const TH = 0.25;       // radial shell thickness per layer (≈ tile width at FREQ=48 ⇒ near-cubic)
+export const TH = 0.16;       // radial shell thickness per layer (≈ tile width at FREQ=75 ⇒ near-cubic)
 export const BASE_R = R - SEA_L * TH;            // radius at layer 0
 export const radius = (L) => BASE_R + L * TH;    // outer radius of layer L's inner edge
 export const MAX_R = radius(LAYERS);             // outermost possible surface (drives camera limits)

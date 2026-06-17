@@ -122,18 +122,26 @@ export function buildHexSphere(freq) {
     columns.push({ id, center: center.clone(), boundary, neighbors, isPentagon, chunk: 0 });
   }
 
-  // ---- chunk assignment: each column → nearest icosahedron-face center (20 chunks) ----
+  // ---- chunk assignment: nearest icosa face, then a quadrant within that face ----
   // Used for partial geometry rebuilds (edit one chunk, not the whole planet) + frustum culling.
+  // SUB quadrants per face keeps chunks small as FREQ grows, so per-edit rebuilds stay snappy.
+  const SUB = 4;                                  // sub-chunks per face → 20·SUB chunks total
   const faceCenters = ICO_FACES.map(([a, b, c]) =>
     ico[a].clone().add(ico[b]).add(ico[c]).normalize());
+  // (Y, X unit axes were declared above for the column tangent basis — reuse them)
+  const faceEast = faceCenters.map((fc) => new THREE.Vector3().crossVectors(fc, Math.abs(fc.y) < 0.99 ? Y : X).normalize());
+  const faceNorth = faceCenters.map((fc, i) => new THREE.Vector3().crossVectors(fc, faceEast[i]).normalize());
+  const _d = new THREE.Vector3();
   for (const col of columns) {
     let best = 0, bestDot = -2;
     for (let f = 0; f < faceCenters.length; f++) {
       const d = col.center.dot(faceCenters[f]);
       if (d > bestDot) { bestDot = d; best = f; }
     }
-    col.chunk = best;
+    _d.copy(col.center).sub(faceCenters[best]);   // offset within the face's tangent plane
+    const q = (_d.dot(faceEast[best]) >= 0 ? 0 : 1) + (_d.dot(faceNorth[best]) >= 0 ? 0 : 2);
+    col.chunk = best * SUB + q;
   }
 
-  return { columns, pentagonCount, chunkCount: ICO_FACES.length, vertCount: geodVerts.length, triCount: tris.length };
+  return { columns, pentagonCount, chunkCount: ICO_FACES.length * SUB, vertCount: geodVerts.length, triCount: tris.length };
 }
