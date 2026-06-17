@@ -197,6 +197,7 @@ export function mountEarth(task) {
     const anchor = new THREE.Vector3(0, 0, 1), fwd = new THREE.Vector3(0, 1, 0);
     let alt = 3, lookAhead = 0.32;                       // fly state
     let wpitch = 0, feetR = 0, velR = 0, grounded = true, pointerLocked = false;   // walk state
+    let camSurfR = R;                                    // sphere radius the crosshair targets (per mode)
     const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), right = new THREE.Vector3();
     const _sa = new THREE.Vector3(), _sf = new THREE.Vector3();
 
@@ -219,7 +220,7 @@ export function mountEarth(task) {
         alt = 2.5;
       } else if (camMode === 'fly') {
         camMode = 'walk';
-        feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = 0;
+        feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.3;   // start looking slightly down at the ground
         renderer.domElement.requestPointerLock?.();      // mouse-look (keydown is a valid gesture)
       } else {
         camMode = 'orbit';
@@ -241,15 +242,17 @@ export function mountEarth(task) {
       for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return radius(L + 1);
       return radius(0);
     }
-    function placeOrbitCamera() { sph.set(camDist, camPhi, camTheta); camera.position.setFromSpherical(sph); camera.up.set(0, 1, 0); camera.lookAt(0, 0, 0); }
+    function placeOrbitCamera() { camSurfR = R; sph.set(camDist, camPhi, camTheta); camera.position.setFromSpherical(sph); camera.up.set(0, 1, 0); camera.lookAt(0, 0, 0); }
     function placeFlyCamera() {
       const surfR = surfaceRadiusAt(anchor);
+      camSurfR = surfR;
       camera.up.copy(anchor);
       camera.position.copy(anchor).multiplyScalar(surfR + alt);
       tmpA.copy(anchor).multiplyScalar(Math.cos(lookAhead)).addScaledVector(fwd, Math.sin(lookAhead));
       camera.lookAt(tmpA.multiplyScalar(surfR));
     }
     function placeWalkCamera() {
+      camSurfR = feetR;
       camera.up.copy(anchor);
       camera.position.copy(anchor).multiplyScalar(feetR + EYE);
       // look = heading (fwd) tilted up/down by wpitch toward local up (anchor)
@@ -331,9 +334,16 @@ export function mountEarth(task) {
     function analyticTarget() {
       raycaster.setFromCamera(CENTER, camera);
       _ro.copy(raycaster.ray.origin); _rd.copy(raycaster.ray.direction);
-      const b = 2 * _ro.dot(_rd), cc = _ro.dot(_ro) - MAX_R * MAX_R, disc = b * b - 4 * cc;
+      // Intersect the crosshair ray with a sphere at the locally-relevant surface radius
+      // (camSurfR, set per camera mode). Use the SMALLEST POSITIVE root so it works whether the
+      // camera is OUTSIDE the sphere (orbit → near/entry hit) or INSIDE it (fly/walk → forward
+      // hit). The old code used MAX_R + the near root only, which returned null when the camera
+      // sat inside the shell — so place/mine silently did nothing in fly and walk.
+      const b = 2 * _ro.dot(_rd), cc = _ro.dot(_ro) - camSurfR * camSurfR, disc = b * b - 4 * cc;
       if (disc < 0) return null;
-      const t = (-b - Math.sqrt(disc)) / 2;
+      const sq = Math.sqrt(disc);
+      let t = (-b - sq) / 2;
+      if (t < 0) t = (-b + sq) / 2;
       if (t < 0) return null;
       _hit.copy(_rd).multiplyScalar(t).add(_ro).normalize();   // surface direction under the crosshair
       const hx = _hit.x, hy = _hit.y, hz = _hit.z;
