@@ -46,7 +46,22 @@ window.OffTime = { go };
 // Skip on localhost so local edits aren't masked by the cache-first cache.
 const isLocalDev = ['localhost', '127.0.0.1', ''].includes(location.hostname);
 if ('serviceWorker' in navigator && location.protocol.startsWith('http') && !isLocalDev) {
+  // Auto-update: a freshly deployed sw.js skipWaiting()s on install and claims clients on
+  // activate (see sw.js). When it takes control we reload once so the page runs the new build —
+  // so a future `git push` (with a bumped CACHE) updates every open tab automatically, no manual
+  // cache-clearing. We skip the reload on the very first install (no previous controller).
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloaded || !hadController) return;
+    reloaded = true;
+    location.reload();
+  });
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+      const check = () => reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+      setInterval(check, 5 * 60 * 1000);        // also poll for a new build every 5 min while open
+    }).catch(() => {});
   });
 }
