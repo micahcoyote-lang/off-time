@@ -20,7 +20,7 @@ import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
 import { terrainFill, buildPlanetChunks, cellIndex, AIR } from './planet-mesh.js';
-import { FREQ, LAYERS, MATERIALS, R, MAX_R, TH, radius } from '../../data/planet.js';
+import { FREQ, LAYERS, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR } from '../../data/planet.js';
 
 const PHI_MIN = 0.15, PHI_MAX = Math.PI - 0.15;
 const FLY_ALT_MIN = 0.8, FLY_ALT_MAX = R * 1.6;      // altitude ABOVE the local surface (not the core)
@@ -76,11 +76,70 @@ export function mountEarth(task) {
     scene.background = new THREE.Color(0x0b1220);          // deep space slate
     const camera = new THREE.PerspectiveCamera(55, 16 / 9, 0.1, MAX_R * 8);
 
-    scene.add(new THREE.HemisphereLight(0xcfe7ff, 0x202b3a, 1.0));
-    scene.add(new THREE.AmbientLight(0xffffff, 0.25));
-    const sun = new THREE.DirectionalLight(0xfff4e0, 0.9);
+    scene.add(new THREE.HemisphereLight(0xcfe7ff, 0x202b3a, 0.8));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.22));
+    const sun = new THREE.DirectionalLight(0xfff4e0, 1.0);
     sun.position.set(MAX_R * 3, MAX_R * 2, MAX_R * 1.5);
-    scene.add(sun);
+    scene.add(sun); scene.add(sun.target);
+
+    // ---- dynamic sun: day/night rotation ----
+    const sunDir = new THREE.Vector3(1, 0, 0);
+    const sunBase = new THREE.Vector3(1, 0, 0);
+    const sunAxis = new THREE.Vector3(0.15, 1, 0.1).normalize();   // slightly tilted "ecliptic"
+    let dayT = DAY_SECONDS * 0.18, timeScale = 1;                  // start mid-morning
+    function updateSun(dt) {
+      dayT += dt * timeScale;
+      sunDir.copy(sunBase).applyAxisAngle(sunAxis, (dayT / DAY_SECONDS) * Math.PI * 2);
+      sun.position.copy(sunDir).multiplyScalar(MAX_R * 4);
+    }
+
+    // ---- atmosphere: rim glow (from space) + sky dome (from the ground) ----
+    const atmU = {
+      uSunDir: { value: sunDir },                  // shared ref, rotated by updateSun
+      uCamPos: { value: new THREE.Vector3() },
+      uAtmColor: { value: new THREE.Color(ATM_COLOR) },
+      uSky: { value: 0 },                          // ground-sky strength: 1 in walk/fly, 0 in orbit (space)
+    };
+    const SKY_VERT = 'varying vec3 vPosW; void main(){ vec4 wp = modelMatrix * vec4(position,1.0); vPosW = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }';
+    const rimMat = new THREE.ShaderMaterial({
+      uniforms: { ...atmU, uPower: { value: 3.0 }, uIntensity: { value: 1.5 } },
+      vertexShader: SKY_VERT,
+      fragmentShader: `
+        uniform vec3 uSunDir, uCamPos, uAtmColor; uniform float uPower, uIntensity; varying vec3 vPosW;
+        void main(){
+          vec3 n = normalize(vPosW);
+          vec3 v = normalize(uCamPos - vPosW);
+          float rim = pow(1.0 - max(dot(v, n), 0.0), uPower);
+          float lit = clamp(dot(n, normalize(uSunDir)) * 0.5 + 0.5, 0.0, 1.0);
+          float glow = rim * uIntensity * (0.2 + 0.8 * lit);
+          gl_FragColor = vec4(uAtmColor * glow, glow);
+        }`,
+      side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const rim = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.28, 48, 32), rimMat);
+    rim.frustumCulled = false; scene.add(rim);
+
+    const skyMat = new THREE.ShaderMaterial({
+      uniforms: { ...atmU },
+      vertexShader: SKY_VERT,
+      fragmentShader: `
+        uniform vec3 uSunDir, uCamPos, uAtmColor; uniform float uSky; varying vec3 vPosW;
+        void main(){
+          vec3 up = normalize(uCamPos);
+          vec3 dir = normalize(vPosW - uCamPos);
+          float h = clamp(dot(dir, up) * 0.5 + 0.5, 0.0, 1.0);          // 0 below .. 1 zenith
+          float sunEl = dot(up, normalize(uSunDir));                    // sun elevation at camera
+          float day = clamp(sunEl * 1.4 + 0.25, 0.0, 1.0);
+          float altFade = 1.0 - smoothstep(${(R * 1.4).toFixed(2)}, ${(R * 2.4).toFixed(2)}, length(uCamPos));
+          vec3 sky = mix(uAtmColor * 1.25, uAtmColor * 0.55, h);        // horizon brighter than zenith
+          float sunset = clamp(1.0 - abs(sunEl) * 3.0, 0.0, 1.0) * (1.0 - h);
+          sky = mix(sky, vec3(1.0, 0.55, 0.3), sunset * 0.6);           // warm band near the terminator
+          gl_FragColor = vec4(sky * day, altFade * uSky);
+        }`,
+      side: THREE.BackSide, transparent: true, depthWrite: false,
+    });
+    const sky = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.22, 48, 32), skyMat);
+    sky.frustumCulled = false; scene.add(sky);
 
     // ---- topology + seeded terrain + saved edits (with size guard) ----
     const { columns, pentagonCount, chunkCount } = buildHexSphere(FREQ);
@@ -272,6 +331,7 @@ export function mountEarth(task) {
       if (k === 'r') { doMine(); return; }
       if (k === 'c') { cycleMat(1); return; }
       if (k === 'v') { cycleMat(-1); return; }
+      if (k === 't') { timeScale = timeScale === 1 ? 30 : 1; return; }   // fast-forward day/night
       if (k === '1') { tool = 'place'; refreshBelt(); drawHud(); return; }
       if (k === '2') { tool = 'mine'; refreshBelt(); drawHud(); return; }
       if (k === ' ') { e.preventDefault(); if (camMode === 'walk') jump(); else tool === 'place' ? doPlace() : doMine(); return; }
@@ -465,6 +525,9 @@ export function mountEarth(task) {
         placeWalkCamera();
       }
       camera.updateMatrixWorld();                          // refresh before raycast — lookAt() alone doesn't
+      updateSun(dt);                                       // day/night rotation
+      atmU.uCamPos.value.copy(camera.position);            // atmosphere/sky need the eye position
+      atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
       renderer.render(scene, camera);
     }
@@ -479,6 +542,8 @@ export function mountEarth(task) {
       planet.dispose();
       scene.remove(highlight); hiGeo.dispose(); hiMat.dispose();
       scene.remove(ghost); ghostGeo.dispose(); ghostMat.dispose();
+      scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
+      scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });

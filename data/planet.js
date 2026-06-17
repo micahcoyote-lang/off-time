@@ -14,6 +14,12 @@ export const BASE_R = R - SEA_L * TH;            // radius at layer 0
 export const radius = (L) => BASE_R + L * TH;    // outer radius of layer L's inner edge
 export const MAX_R = radius(LAYERS);             // outermost possible surface (drives camera limits)
 
+// ---- Tier 1 visuals (lighting / atmosphere / water) ----
+export const DAY_SECONDS = 120;   // real seconds for one full day/night rotation of the sun
+export const ATM_COLOR = 0x6db3ff; // atmosphere / sky tint (earth blue; tweak for alien worlds)
+export const AO_MIN = 0.55;       // darkest ambient-occlusion factor for tucked-in vertices
+export const WATER_OPACITY = 0.62; // translucency of the water layer
+
 // kind: 'terrain' (procedurally placed) | 'block' (creative building blocks).
 export const MATERIALS = [
   { id: 'stone', title: 'Stone', emoji: '🪨', color: 0x6b6660, kind: 'terrain' },
