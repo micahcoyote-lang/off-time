@@ -20,7 +20,7 @@ import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
 import { terrainFill, buildPlanetChunks, cellIndex, AIR } from './planet-mesh.js';
-import { FREQ, LAYERS, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR } from '../../data/planet.js';
+import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR } from '../../data/planet.js';
 
 const PHI_MIN = 0.15, PHI_MAX = Math.PI - 0.15;
 const FLY_ALT_MIN = 0.8, FLY_ALT_MAX = R * 1.6;      // altitude ABOVE the local surface (not the core)
@@ -180,6 +180,20 @@ export function mountEarth(task) {
     window.__earthDebug = { columns: columns.length, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
     console.log('[earth] hex planet:', window.__earthDebug);
 
+    // ---- tallest peak: scan every column's surface, mark the highest with a gold beacon ----
+    let peakCol = 0, peakL = 0, peakR = -1;
+    for (let i = 0; i < N; i++) {
+      const b = i * LAYERS;
+      for (let L = LAYERS - 1; L >= 0; L--) {
+        if (cells[b + L] !== AIR) { const r = radius(L + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = L; } break; }
+      }
+    }
+    const peakAbove = peakL + 1 - SEA_L;                    // layers above sea level (the "height")
+    const beacon = new THREE.Mesh(new THREE.ConeGeometry(0.18, 2.2, 8), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
+    beacon.position.copy(columns[peakCol].center).multiplyScalar(peakR + 1.1);
+    beacon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), columns[peakCol].center);   // point outward (radial)
+    beacon.frustumCulled = false; scene.add(beacon);
+
     // ---- highlight outline (always on target) + place ghost (Place tool only) ----
     const hiMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7, depthTest: false });
     const hiGeo = new THREE.BufferGeometry();
@@ -242,6 +256,7 @@ export function mountEarth(task) {
         `<span class="chip">${tool === 'place' ? '🧱 Place' : '⛏️ Mine'}</span>` +
         `<span class="chip">${m.emoji} ${m.title}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
+        `<span class="chip">🏔️ peak +${peakAbove}</span>` +
         `<span class="chip">${mode}</span>`;
     }
     function refreshBelt() {
@@ -559,6 +574,7 @@ export function mountEarth(task) {
       scene.remove(ghost); ghostGeo.dispose(); ghostMat.dispose();
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
+      scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });

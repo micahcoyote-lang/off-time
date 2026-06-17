@@ -54,21 +54,24 @@ function makeNoise(seed) {
 export function terrainFill(columns, seed) {
   const fbm = makeNoise(seed);
   const cells = new Uint8Array(columns.length * LAYERS);   // 0 = air everywhere by default
-  const NF = 1.7, AMP = 8, HF = 2.3;                       // elevation freq, height amplitude, humidity freq
+  const CF = 0.85, NF = 1.7, AMP = 8, HF = 2.3, CAVEF = 0.55;  // continent / detail / humidity / cave freqs
   for (const col of columns) {
     const c = col.center;
-    let e = fbm(c.x * NF + 11.3, c.y * NF + 5.7, c.z * NF + 1.9);
-    e = (e - 0.5) * 2;                                      // center to ~[-1,1]
+    // ---- continents: a broad low-frequency mask makes a few big landmasses, plus finer detail ----
+    const cont = fbm(c.x * CF + 2.7, c.y * CF - 4.1, c.z * CF + 8.3);
+    const detail = fbm(c.x * NF + 11.3, c.y * NF + 5.7, c.z * NF + 1.9);
     const lat = Math.abs(c.y);                              // 0 equator … 1 pole
+    let e = (cont - 0.52) * 3.0 + (detail - 0.5) * 1.1;     // continental shape + coastline ruggedness
     e -= Math.pow(lat, 3) * 0.45;                           // poles trend lower (sea/ice)
     let surf = Math.round(SEA_L + e * AMP);
     surf = Math.max(CORE_L + 1, Math.min(LAYERS - 1, surf));
     const base = col.id * LAYERS;
 
-    // ---- climate model → surface biome ----
+    // ---- climate model → surface biome (jittered to dither hard biome borders) ----
     const elevAbove = Math.max(0, surf - SEA_L);
-    const temp = Math.max(0, Math.min(1, (1 - lat * 1.15) - elevAbove * 0.045));  // hot equator, cold poles/peaks
-    const hum = fbm(c.x * HF - 7.1, c.y * HF + 19.3, c.z * HF - 3.7);             // 0..1 humidity field
+    const jit = (fbm(c.x * 9.0 - 1.3, c.y * 9.0 + 4.4, c.z * 9.0 - 8.8) - 0.5) * 0.12;
+    const temp = Math.max(0, Math.min(1, (1 - lat * 1.15) - elevAbove * 0.045 + jit));
+    const hum = Math.max(0, Math.min(1, fbm(c.x * HF - 7.1, c.y * HF + 19.3, c.z * HF - 3.7) + jit));
     let topMat;
     if (surf <= SEA_L + 1) topMat = NUM.sand;              // shoreline / shallow seabed
     else if (elevAbove > 6) topMat = temp < 0.35 ? NUM.snow : NUM.rock;  // peaks: snowcap if cold, else rock
@@ -81,6 +84,11 @@ export function terrainFill(columns, seed) {
 
     for (let L = 0; L <= surf; L++)
       cells[base + L] = L < surf - 3 ? NUM.stone : (L < surf ? NUM.dirt : topMat);
+    // ---- caves: carve sparse 3D-noise pockets underground (keep the surface crust intact) ----
+    for (let L = CORE_L + 1; L <= surf - 2; L++) {
+      const r = (radius(L) + radius(L + 1)) / 2;
+      if (fbm(c.x * r * CAVEF + 30.0, c.y * r * CAVEF - 12.0, c.z * r * CAVEF + 5.0) > 0.7) cells[base + L] = AIR;
+    }
     if (surf < SEA_L) {                                    // flood low columns up to sea level
       for (let L = surf + 1; L <= SEA_L; L++) cells[base + L] = NUM.water;
     }
