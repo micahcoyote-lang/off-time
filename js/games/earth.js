@@ -440,6 +440,7 @@ export function mountEarth(task) {
         if (feetR <= ground) { feetR = ground; velR = 0; grounded = true; } else grounded = false;
         placeWalkCamera();
       }
+      camera.updateMatrixWorld();                          // refresh before raycast — lookAt() alone doesn't
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
       renderer.render(scene, camera);
     }

@@ -84,7 +84,22 @@ export function terrainFill(columns, seed) {
 /* ---- geometry assembly (face-culled, vertex-colored) ---- */
 const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _nrm = new THREE.Vector3(), _out = new THREE.Vector3();
 const _ref = new THREE.Vector3();
-const _side = new THREE.Color();
+const _top = new THREE.Color(), _sideC = new THREE.Color();
+const GRASS_NUM = NUM.grass, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
+
+// Per-vertex brightness from a hash of the (quantized) vertex position → a stable, seam-free
+// "texture" speckle on every hexel. Shared positions hash the same, so faces meet without seams.
+function vertShade(v) {
+  const xi = (v.x * 11) | 0, yi = (v.y * 11) | 0, zi = (v.z * 11) | 0;
+  let h = Math.imul(xi, 374761393) ^ Math.imul(yi, 668265263) ^ Math.imul(zi + 1, 1274126177);
+  h ^= h >>> 13; h = Math.imul(h, 1274126177); h ^= h >>> 15;
+  return 0.84 + ((h >>> 0) % 1000) / 1000 * 0.16;          // 0.84 … 1.00
+}
+function pushVert(p, col, positions, colors) {
+  const s = vertShade(p);
+  positions.push(p.x, p.y, p.z);
+  colors.push(col.r * s, col.g * s, col.b * s);
+}
 
 // Orient winding so the face points away from `ref` (the cell's center). This is correct for
 // BOTH top faces (ref below → normal points up/out) and side walls (ref on the column axis →
@@ -95,8 +110,7 @@ function pushTri(p0, p1, p2, col, ref, positions, colors) {
   _out.copy(p0).add(p1).add(p2).multiplyScalar(1 / 3).sub(ref);   // face centroid − cell center
   let a = p0, b = p1, c = p2;
   if (_nrm.dot(_out) < 0) { b = p2; c = p1; }                      // flip so the face points outward
-  positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
-  for (let i = 0; i < 3; i++) colors.push(col.r, col.g, col.b);
+  pushVert(a, col, positions, colors); pushVert(b, col, positions, colors); pushVert(c, col, positions, colors);
 }
 
 // emit one column's exposed faces into positions/colors (neighbor lookups span chunks via `cells`)
@@ -105,24 +119,25 @@ function emitColumn(col, cells, positions, colors) {
   for (let L = 0; L < LAYERS; L++) {
     const matn = cells[base + L];
     if (matn === AIR) continue;
-    const color = COLORS[matn];
     const rOut = radius(L + 1), rIn = radius(L);
     _ref.copy(col.center).multiplyScalar((rIn + rOut) / 2);        // this cell's center
+    _top.copy(COLORS[matn]);                                       // top face = the material colour
+    // grass blocks show brown (dirt) on their sides; everything else just darkens its own colour
+    _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
 
     const topAir = (L + 1 >= LAYERS) || cells[base + L + 1] === AIR;
     if (topAir) {
       const ctr = col.center.clone().multiplyScalar(rOut);
       for (let k = 0; k < n; k++)
-        pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), color, _ref, positions, colors);
+        pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _top, _ref, positions, colors);
     }
-    _side.copy(color).multiplyScalar(0.8);
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
       if (!(nb < 0 || cells[nb * LAYERS + L] === AIR)) continue;
       const aOut = bnd[k].clone().multiplyScalar(rOut), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rOut);
       const aIn = bnd[k].clone().multiplyScalar(rIn), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rIn);
-      pushTri(aOut, bOut, bIn, _side, _ref, positions, colors);
-      pushTri(aOut, bIn, aIn, _side, _ref, positions, colors);
+      pushTri(aOut, bOut, bIn, _sideC, _ref, positions, colors);
+      pushTri(aOut, bIn, aIn, _sideC, _ref, positions, colors);
     }
   }
 }
