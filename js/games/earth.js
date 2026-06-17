@@ -30,6 +30,7 @@ const WALK_SPEED = 0.18;      // rad/s along the surface
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
+const WALK_REACH = 2.2 / FREQ; // angular reach ahead (~2 tiles) for the "block in front" target
 
 export function mountEarth(task) {
   document.body.classList.add('earth-wide');           // lift the 480px #app cap (theme-game.css)
@@ -355,9 +356,22 @@ export function mountEarth(task) {
       return null;
     }
 
+    // walk targets the block directly AHEAD of the player (independent of look pitch),
+    // Minecraft-style: a point ~WALK_REACH along the heading → that column's topmost solid cell.
+    function walkTarget() {
+      _hit.copy(anchor).multiplyScalar(Math.cos(WALK_REACH)).addScaledVector(fwd, Math.sin(WALK_REACH)).normalize();
+      const hx = _hit.x, hy = _hit.y, hz = _hit.z;
+      let best = -1, bd = -2;
+      for (let i = 0; i < N; i++) { const d = cx[i] * hx + cy[i] * hy + cz[i] * hz; if (d > bd) { bd = d; best = i; } }
+      if (best < 0) return null;
+      const base = best * LAYERS;
+      for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
+      return null;
+    }
+
     let lastTargetKey = '', lastGhostKey = '';
     function updateTargeting() {
-      target = analyticTarget();
+      target = camMode === 'walk' ? walkTarget() : analyticTarget();
       const tkey = target ? `${target.colId},${target.L}` : '';
       if (tkey !== lastTargetKey) {
         lastTargetKey = tkey;
