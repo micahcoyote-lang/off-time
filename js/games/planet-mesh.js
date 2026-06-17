@@ -54,7 +54,7 @@ function makeNoise(seed) {
 export function terrainFill(columns, seed) {
   const fbm = makeNoise(seed);
   const cells = new Uint8Array(columns.length * LAYERS);   // 0 = air everywhere by default
-  const NF = 1.7, AMP = 8;                                 // noise frequency over unit sphere, height amplitude
+  const NF = 1.7, AMP = 8, HF = 2.3;                       // elevation freq, height amplitude, humidity freq
   for (const col of columns) {
     const c = col.center;
     let e = fbm(c.x * NF + 11.3, c.y * NF + 5.7, c.z * NF + 1.9);
@@ -64,17 +64,24 @@ export function terrainFill(columns, seed) {
     let surf = Math.round(SEA_L + e * AMP);
     surf = Math.max(CORE_L + 1, Math.min(LAYERS - 1, surf));
     const base = col.id * LAYERS;
-    for (let L = 0; L <= surf; L++) {
-      let mat;
-      if (L < surf - 3) mat = NUM.stone;
-      else if (L < surf) mat = NUM.dirt;
-      else if (surf <= SEA_L + 1) mat = NUM.sand;          // beach / seafloor
-      else if (lat > 0.82) mat = NUM.snow;                 // ice caps
-      else if (surf > SEA_L + 5) mat = NUM.rock;           // mountains
-      else mat = NUM.grass;
-      cells[base + L] = mat;
-    }
-    if (surf < SEA_L) {                                     // flood low columns up to sea level
+
+    // ---- climate model → surface biome ----
+    const elevAbove = Math.max(0, surf - SEA_L);
+    const temp = Math.max(0, Math.min(1, (1 - lat * 1.15) - elevAbove * 0.045));  // hot equator, cold poles/peaks
+    const hum = fbm(c.x * HF - 7.1, c.y * HF + 19.3, c.z * HF - 3.7);             // 0..1 humidity field
+    let topMat;
+    if (surf <= SEA_L + 1) topMat = NUM.sand;              // shoreline / shallow seabed
+    else if (elevAbove > 6) topMat = temp < 0.35 ? NUM.snow : NUM.rock;  // peaks: snowcap if cold, else rock
+    else if (temp < 0.20) topMat = NUM.snow;              // frigid
+    else if (temp < 0.40) topMat = NUM.tundra;            // cold
+    else if (temp > 0.70 && hum < 0.40) topMat = NUM.sand;    // hot + dry → desert
+    else if (temp > 0.50 && hum < 0.50) topMat = NUM.savanna; // warm + semi-dry
+    else if (hum > 0.62) topMat = NUM.forest;            // wet → forest
+    else topMat = NUM.grass;                             // temperate
+
+    for (let L = 0; L <= surf; L++)
+      cells[base + L] = L < surf - 3 ? NUM.stone : (L < surf ? NUM.dirt : topMat);
+    if (surf < SEA_L) {                                    // flood low columns up to sea level
       for (let L = surf + 1; L <= SEA_L; L++) cells[base + L] = NUM.water;
     }
   }

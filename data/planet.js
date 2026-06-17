@@ -33,6 +33,10 @@ export const MATERIALS = [
   { id: 'wood',  title: 'Wood',  emoji: '🪵', color: 0xceaa72, kind: 'block' },
   { id: 'glass', title: 'Glass', emoji: '🟦', color: 0xbfe3ff, kind: 'block' },
   { id: 'gold',  title: 'Gold',  emoji: '🟨', color: 0xe8c14a, kind: 'block' },
+  // biome surfaces (appended so existing ids stay stable; used by climate-driven generation)
+  { id: 'forest',  title: 'Forest',  emoji: '🌲', color: 0x2f5a2c, kind: 'terrain' },
+  { id: 'savanna', title: 'Savanna', emoji: '🌾', color: 0xb3a24f, kind: 'terrain' },
+  { id: 'tundra',  title: 'Tundra',  emoji: '🧊', color: 0x9aa890, kind: 'terrain' },
 ];
 
 export const PLANET_TOOLS = [
