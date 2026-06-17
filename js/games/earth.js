@@ -119,7 +119,9 @@ export function mountEarth(task) {
         void main(){
           vec3 n = normalize(vPosW);
           vec3 v = normalize(uCamPos - vPosW);
-          float rim = pow(1.0 - max(dot(v, n), 0.0), uPower);
+          // peak at the limb (v ⟂ n), fade to 0 toward BOTH the planet centre and deep space —
+          // abs() prevents the whole far hemisphere from glowing and flooding the background.
+          float rim = pow(1.0 - abs(dot(v, n)), uPower);
           float lit = clamp(dot(n, normalize(uSunDir)) * 0.5 + 0.5, 0.0, 1.0);
           float glow = rim * uIntensity * (0.2 + 0.8 * lit);
           gl_FragColor = vec4(uAtmColor * glow, glow);
