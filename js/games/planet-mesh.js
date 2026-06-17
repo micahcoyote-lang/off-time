@@ -11,7 +11,7 @@
    radius(L+1). cell(c, L) = c * LAYERS + L. */
 
 import * as THREE from '../../assets/vendor/three.module.js';
-import { LAYERS, CORE_L, SEA_L, MATERIALS, radius } from '../../data/planet.js';
+import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN, WATER_OPACITY } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -84,8 +84,9 @@ export function terrainFill(columns, seed) {
 /* ---- geometry assembly (face-culled, vertex-colored) ---- */
 const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _nrm = new THREE.Vector3(), _out = new THREE.Vector3();
 const _ref = new THREE.Vector3();
-const _top = new THREE.Color(), _sideC = new THREE.Color();
-const GRASS_NUM = NUM.grass, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
+const _top = new THREE.Color(), _sideC = new THREE.Color(), _sideBot = new THREE.Color();
+const GRASS_NUM = NUM.grass, WATER_NUM = NUM.water, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
+const WALL_BASE_AO = 0.7;                                   // wall bottoms this fraction as bright as tops
 
 // Per-vertex brightness from a hash of the (quantized) vertex position → a stable, seam-free
 // "texture" speckle on every hexel. Shared positions hash the same, so faces meet without seams.
@@ -105,39 +106,51 @@ function pushVert(p, col, positions, colors) {
 // BOTH top faces (ref below → normal points up/out) and side walls (ref on the column axis →
 // normal points sideways toward the neighbour/air). A radial-from-origin test fails for side
 // walls (their normal is ~tangential), which made them randomly back-face-cull (see-through).
-function pushTri(p0, p1, p2, col, ref, positions, colors) {
+// per-vertex colours (for AO gradients); orients winding away from `ref` (the cell centre)
+function pushTriC(p0, p1, p2, c0, c1, c2, ref, positions, colors) {
   _e1.subVectors(p1, p0); _e2.subVectors(p2, p0); _nrm.crossVectors(_e1, _e2);
-  _out.copy(p0).add(p1).add(p2).multiplyScalar(1 / 3).sub(ref);   // face centroid − cell center
-  let a = p0, b = p1, c = p2;
-  if (_nrm.dot(_out) < 0) { b = p2; c = p1; }                      // flip so the face points outward
-  pushVert(a, col, positions, colors); pushVert(b, col, positions, colors); pushVert(c, col, positions, colors);
+  _out.copy(p0).add(p1).add(p2).multiplyScalar(1 / 3).sub(ref);
+  let a = p0, b = p1, c = p2, ca = c0, cb = c1, cc = c2;
+  if (_nrm.dot(_out) < 0) { b = p2; c = p1; cb = c2; cc = c1; }     // flip face + its vertex colours together
+  pushVert(a, ca, positions, colors); pushVert(b, cb, positions, colors); pushVert(c, cc, positions, colors);
+}
+function pushTri(p0, p1, p2, col, ref, positions, colors) {
+  pushTriC(p0, p1, p2, col, col, col, ref, positions, colors);
 }
 
-// emit one column's exposed faces into positions/colors (neighbor lookups span chunks via `cells`)
-function emitColumn(col, cells, positions, colors) {
+// emit one column's exposed faces; water faces go to the separate (transparent) buffer.
+// Neighbor lookups span chunks via the global `cells`.
+function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
   const base = col.id * LAYERS, bnd = col.boundary, neigh = col.neighbors, n = bnd.length;
   for (let L = 0; L < LAYERS; L++) {
     const matn = cells[base + L];
     if (matn === AIR) continue;
+    const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
+    const colors = matn === WATER_NUM ? wCol : sCol;
     const rOut = radius(L + 1), rIn = radius(L);
     _ref.copy(col.center).multiplyScalar((rIn + rOut) / 2);        // this cell's center
-    _top.copy(COLORS[matn]);                                       // top face = the material colour
-    // grass blocks show brown (dirt) on their sides; everything else just darkens its own colour
-    _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
 
     const topAir = (L + 1 >= LAYERS) || cells[base + L + 1] === AIR;
     if (topAir) {
+      // AO: darken a top face that's hemmed in by taller neighbours (pit floor / wall base)
+      let walled = 0;
+      for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && cells[nb * LAYERS + L + 1] !== AIR) walled++; }
+      const aoTop = 1 - (1 - AO_MIN) * (walled / n);
+      _top.copy(COLORS[matn]).multiplyScalar(aoTop);
       const ctr = col.center.clone().multiplyScalar(rOut);
       for (let k = 0; k < n; k++)
         pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _top, _ref, positions, colors);
     }
+    // grass blocks show brown (dirt) on their sides; else darken the material; AO fades wall bottoms
+    _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
+    _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
       if (!(nb < 0 || cells[nb * LAYERS + L] === AIR)) continue;
       const aOut = bnd[k].clone().multiplyScalar(rOut), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rOut);
       const aIn = bnd[k].clone().multiplyScalar(rIn), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rIn);
-      pushTri(aOut, bOut, bIn, _sideC, _ref, positions, colors);
-      pushTri(aOut, bIn, aIn, _sideC, _ref, positions, colors);
+      pushTriC(aOut, bOut, bIn, _sideC, _sideC, _sideBot, _ref, positions, colors);   // top verts bright, bottom dark
+      pushTriC(aOut, bIn, aIn, _sideC, _sideBot, _sideBot, _ref, positions, colors);
     }
   }
 }
@@ -149,44 +162,52 @@ export function buildPlanetChunks(columns, cells, chunkCount) {
   for (const col of columns) groups[col.chunk].push(col);
   // Lambert (cheap, diffuse-only) instead of Standard PBR — the non-indexed geometry already
   // has per-face-constant normals, so it still reads as crisp flat-shaded facets but costs far
-  // less per fragment (big win full-screen on integrated GPUs).
-  const material = new THREE.MeshLambertMaterial({ vertexColors: true });
+  // less per fragment (big win full-screen on integrated GPUs). Water is a second, translucent
+  // material rendered after the opaque solids.
+  const solidMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  const waterMat = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, opacity: WATER_OPACITY, depthWrite: false });
 
-  function fill(geo, group) {
-    const positions = [], colors = [];
-    for (const col of group) emitColumn(col, cells, positions, colors);
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    geo.computeBoundingSphere();
-    return positions.length / 9;
+  function fillPair(solidGeo, waterGeo, group) {
+    const sP = [], sC = [], wP = [], wC = [];
+    for (const col of group) emitColumn(col, cells, sP, sC, wP, wC);
+    solidGeo.setAttribute('position', new THREE.Float32BufferAttribute(sP, 3));
+    solidGeo.setAttribute('color', new THREE.Float32BufferAttribute(sC, 3));
+    solidGeo.computeVertexNormals(); solidGeo.computeBoundingSphere();
+    waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(wP, 3));
+    waterGeo.setAttribute('color', new THREE.Float32BufferAttribute(wC, 3));
+    waterGeo.computeVertexNormals(); waterGeo.computeBoundingSphere();
+    return (sP.length + wP.length) / 9;
   }
 
   const entries = [];
   let triCount = 0;
   for (let i = 0; i < chunkCount; i++) {
-    const geo = new THREE.BufferGeometry();
-    triCount += fill(geo, groups[i]);
-    entries.push({ group: groups[i], mesh: new THREE.Mesh(geo, material) });
+    const solidGeo = new THREE.BufferGeometry(), waterGeo = new THREE.BufferGeometry();
+    triCount += fillPair(solidGeo, waterGeo, groups[i]);
+    const solidMesh = new THREE.Mesh(solidGeo, solidMat);
+    solidMesh.castShadow = true; solidMesh.receiveShadow = true;
+    const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+    waterMesh.renderOrder = 1;                 // draw after opaque solids (transparent)
+    entries.push({ group: groups[i], solidMesh, waterMesh });
   }
 
   return {
-    meshes: entries.map((e) => e.mesh),
+    meshes: entries.flatMap((e) => [e.solidMesh, e.waterMesh]),
     triCount,
     // rebuild only the given chunk ids (a Set or array) — used after an edit
     rebuild(chunkIds) {
       for (const id of chunkIds) {
         const e = entries[id];
-        const old = e.mesh.geometry;
-        const geo = new THREE.BufferGeometry();
-        fill(geo, e.group);
-        e.mesh.geometry = geo;
-        old.dispose();
+        const oldS = e.solidMesh.geometry, oldW = e.waterMesh.geometry;
+        const solidGeo = new THREE.BufferGeometry(), waterGeo = new THREE.BufferGeometry();
+        fillPair(solidGeo, waterGeo, e.group);
+        e.solidMesh.geometry = solidGeo; e.waterMesh.geometry = waterGeo;
+        oldS.dispose(); oldW.dispose();
       }
     },
     dispose() {
-      for (const e of entries) e.mesh.geometry.dispose();
-      material.dispose();
+      for (const e of entries) { e.solidMesh.geometry.dispose(); e.waterMesh.geometry.dispose(); }
+      solidMat.dispose(); waterMat.dispose();
     },
   };
 }

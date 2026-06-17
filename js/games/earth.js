@@ -69,6 +69,9 @@ export function mountEarth(task) {
       return;
     }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));   // cap fragment load on retina/integrated GPUs
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false;        // re-render the shadow map only a few times/sec (sun moves slowly)
     renderer.domElement.style.cssText = 'display:block;width:100%;height:100%;touch-action:none;cursor:grab';
     view.appendChild(renderer.domElement);
 
@@ -80,6 +83,13 @@ export function mountEarth(task) {
     scene.add(new THREE.AmbientLight(0xffffff, 0.22));
     const sun = new THREE.DirectionalLight(0xfff4e0, 1.0);
     sun.position.set(MAX_R * 3, MAX_R * 2, MAX_R * 1.5);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.bias = -0.0004;
+    sun.shadow.normalBias = 0.08;
+    { const c = sun.shadow.camera;                 // orthographic frustum sized to the planet
+      c.left = -MAX_R * 1.3; c.right = MAX_R * 1.3; c.top = MAX_R * 1.3; c.bottom = -MAX_R * 1.3;
+      c.near = MAX_R * 2; c.far = MAX_R * 6; c.updateProjectionMatrix(); }
     scene.add(sun); scene.add(sun.target);
 
     // ---- dynamic sun: day/night rotation ----
@@ -163,7 +173,7 @@ export function mountEarth(task) {
 
     // ---- chunked planet meshes (rebuilt selectively on edit) ----
     const planet = buildPlanetChunks(columns, cells, chunkCount);
-    planet.meshes.forEach((m) => scene.add(m));
+    planet.meshes.forEach((m) => scene.add(m));            // solids cast/receive shadows (set in buildPlanetChunks); water is translucent
 
     window.__earthDebug = { columns: columns.length, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
     console.log('[earth] hex planet:', window.__earthDebug);
@@ -188,6 +198,7 @@ export function mountEarth(task) {
     const matNum = () => matIdx + 1;                       // numeric id (0 = air)
     let target = null;                                    // { colId, L } topmost solid cell under crosshair
     let needsTarget = true;                               // recompute target this frame (set on edit)
+    let shadowDirty = true, shadowAcc = 0;                // refresh shadow map on edits + a few times/sec
 
     // a Place stacks on top of the targeted column's surface cell
     function placementCell(tg) {
@@ -205,7 +216,7 @@ export function mountEarth(task) {
       const ci = cellIndex(colId, L);
       cells[ci] = m; edits.set(ci, m);
       planet.rebuild(affectedChunks(colId));
-      needsTarget = true;                                 // surface height changed under the crosshair
+      needsTarget = true; shadowDirty = true;             // surface height changed under the crosshair
       persist(); markTaskDone('earth'); drawHud();
     }
     function doPlace() {
@@ -528,6 +539,8 @@ export function mountEarth(task) {
       updateSun(dt);                                       // day/night rotation
       atmU.uCamPos.value.copy(camera.position);            // atmosphere/sky need the eye position
       atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
+      shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
+      if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
       renderer.render(scene, camera);
     }
