@@ -1,0 +1,158 @@
+/* theme-doodle.css — the hand-drawn "shell" skin: notebook paper, wobbly ink borders.
+   Applied to intro, home, lists, settings, modals. */
+
+#app {
+  background-color: var(--paper);
+  /* faint ruled-paper lines + margin line */
+  background-image:
+    linear-gradient(90deg, transparent 38px, rgba(232, 98, 74, 0.25) 38px 40px, transparent 40px),
+    repeating-linear-gradient(0deg, transparent 0 31px, var(--paper-line) 31px 32px);
+  background-attachment: local;
+}
+
+/* Hand-drawn font for headings / character speech */
+.screen-title,
+.section-head,
+.doodle-font { font-family: 'Patrick Hand', cursive; }
+
+/* Wobbly "drawn" border helper (slightly irregular radius) */
+.doodle-box {
+  background: #fff;
+  border: 2.5px solid var(--ink);
+  border-radius: 255px 12px 225px 15px / 15px 225px 12px 255px;
+  box-shadow: 3px 4px 0 rgba(43, 43, 43, 0.15);
+}
+
+/* Home category cards */
+.home-hero {
+  text-align: center;
+  padding: 26px 16px 6px;
+}
+.home-logo {
+  font-family: 'Patrick Hand', cursive;
+  font-size: 3rem;
+  line-height: 0.95;
+}
+.home-tagline { opacity: 0.7; margin-top: 4px; }
+
+.cat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 16px;
+}
+.cat-card {
+  background: #fff;
+  border: 2.5px solid var(--ink);
+  border-radius: 255px 14px 225px 16px / 16px 225px 14px 255px;
+  padding: 20px 14px;
+  text-align: center;
+  cursor: pointer;
+  font: inherit;
+  box-shadow: 4px 5px 0 rgba(43, 43, 43, 0.16);
+  transition: transform 90ms ease, box-shadow 90ms ease;
+}
+.cat-card:active { transform: translate(2px, 3px); box-shadow: 2px 2px 0 rgba(43,43,43,.16); }
+.cat-card .cat-emoji { font-size: 2.6rem; display: block; }
+.cat-card .cat-name {
+  display: block;
+  font-family: 'Patrick Hand', cursive;
+  font-size: 1.5rem;
+  margin-top: 6px;
+}
+.cat-card .cat-sub { display: block; font-size: 0.8em; opacity: 0.65; margin-top: 2px; }
+
+/* Music showcase play button */
+.music-play {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 2.5px solid var(--ink);
+  background: var(--accent-2);
+  color: #fff;
+  font-size: 1.1rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 2px 3px 0 rgba(43,43,43,.16);
+}
+.music-play:active { transform: translate(1px, 2px); box-shadow: 1px 1px 0 rgba(43,43,43,.16); }
+
+/* Settings gear corner button */
+.gear {
+  border: 2.5px solid var(--ink);
+  background: #fff;
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  font-size: 1.3rem;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: 2px 3px 0 rgba(43,43,43,.16);
+}
+
+/* ---------- Intro scene ---------- */
+.intro {
+  align-items: center;
+  justify-content: flex-end;
+  text-align: center;
+}
+.intro-stage {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.intro-stage svg { width: min(86%, 360px); height: auto; }
+
+.speech {
+  position: relative;
+  background: #fff;
+  border: 2.5px solid var(--ink);
+  border-radius: 18px;
+  padding: 16px 18px;
+  margin: 0 20px 8px;
+  max-width: 360px;
+  font-family: 'Patrick Hand', cursive;
+  font-size: 1.5rem;
+  box-shadow: 3px 4px 0 rgba(43,43,43,.15);
+  animation: pop-in 220ms cubic-bezier(.2,.9,.3,1.2) both;
+}
+.speech::after {
+  content: "";
+  position: absolute;
+  bottom: -16px;
+  left: 40px;
+  border: 9px solid transparent;
+  border-top-color: var(--ink);
+}
+.speech::before {
+  content: "";
+  position: absolute;
+  bottom: -11px;
+  left: 42px;
+  border: 7px solid transparent;
+  border-top-color: #fff;
+  z-index: 1;
+}
+
+.intro-controls {
+  display: flex;
+  gap: 12px;
+  padding: 18px;
+  width: 100%;
+  justify-content: center;
+}
+.intro-dots { display: flex; gap: 8px; align-items: center; justify-content: center; padding-bottom: 8px; }
+.intro-dots i {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--ink); opacity: 0.25; display: inline-block;
+}
+.intro-dots i.on { opacity: 1; }
+
+/* head turn animation for the "look over shoulder" beat */
+.look .fig-head { transform-box: fill-box; transform-origin: center; animation: peek 600ms ease both; }
+@keyframes peek { from { transform: rotate(0); } to { transform: rotate(-12deg) translateX(-2px); } }

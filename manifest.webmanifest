@@ -1,0 +1,19 @@
+{
+  "name": "Off Time",
+  "short_name": "Off Time",
+  "description": "Random, hard tasks to fill your boredom — for the middle of life.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4efe1",
+  "theme_color": "#f4efe1",
+  "icons": [
+    {
+      "src": "assets/img/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

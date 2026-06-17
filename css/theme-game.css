@@ -1,0 +1,426 @@
+/* theme-game.css — the flat modern vector skin for actual gameplay screens.
+   Scoped under .game so it never leaks into the doodle shell. */
+
+.game {
+  background: #1f2937;        /* deep slate */
+  color: #f8fafc;
+  font-family: 'Nunito', system-ui, sans-serif;
+}
+.game .topbar { color: #f8fafc; }
+.game .btn-back { color: #f8fafc; }
+.game .screen-title { font-family: 'Nunito', sans-serif; font-weight: 800; }
+
+.game-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 16px;
+}
+
+.game-hud {
+  display: flex;
+  gap: 18px;
+  font-weight: 800;
+  font-size: 1.05rem;
+}
+.game-hud .chip {
+  background: rgba(255,255,255,0.1);
+  padding: 6px 14px;
+  border-radius: 999px;
+}
+
+/* ---- Sliding puzzle ---- */
+.puzzle-grid {
+  display: grid;
+  gap: 8px;
+  width: min(88vw, 360px);
+  aspect-ratio: 1;
+}
+.tile {
+  border: none;
+  border-radius: 14px;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: clamp(1.4rem, 8vw, 2.4rem);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(145deg, #38bdf8, #2563eb);
+  box-shadow: 0 4px 0 rgba(0,0,0,0.25);
+  transition: transform 90ms ease;
+}
+.tile:active { transform: scale(0.96); }
+.tile.blank {
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+.tile.correct { background: linear-gradient(145deg, #34d399, #059669); }
+.tile.hint {
+  animation: hint-pulse 0.9s ease-in-out infinite;
+  outline: 3px solid #fbbf24;
+  outline-offset: -3px;
+}
+@keyframes hint-pulse {
+  0%, 100% { box-shadow: 0 4px 0 rgba(0,0,0,0.25), 0 0 0 0 rgba(251,191,36,0.6); }
+  50%      { box-shadow: 0 4px 0 rgba(0,0,0,0.25), 0 0 18px 6px rgba(251,191,36,0.7); }
+}
+
+/* ---- Difficulty picker ---- */
+.diff-row { display: flex; gap: 8px; }
+.diff-btn {
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+  border: 2px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.08);
+  color: #f8fafc;
+  padding: 8px 16px;
+  border-radius: 999px;
+}
+.diff-btn.active {
+  background: #38bdf8;
+  border-color: #38bdf8;
+  color: #06283d;
+}
+
+.game-controls { display: flex; gap: 12px; }
+
+.game .btn { background: #38bdf8; box-shadow: 0 4px 0 #0c6fb8; }
+.game .btn.secondary { background: #f59e0b; box-shadow: 0 4px 0 #b45309; }
+
+/* ---- Office Trash ---- */
+.ot-view {
+  width: min(94vw, 460px);
+  aspect-ratio: 4 / 3;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 8px 22px rgba(0,0,0,0.4);
+  border: 2px solid rgba(255,255,255,0.08);
+  perspective: 700px;
+}
+.ot-svg { display: block; width: 100%; height: auto; transform-origin: center; }
+
+/* Smooth "pan" when turning, and a gentle step-forward zoom, so movement
+   doesn't snap jarringly. */
+.ot-view.anim-left    .ot-svg { animation: ot-pan-left  340ms ease-out; }
+.ot-view.anim-right   .ot-svg { animation: ot-pan-right 340ms ease-out; }
+.ot-view.anim-about   .ot-svg { animation: ot-pan-about 420ms ease-out; }
+.ot-view.anim-step    .ot-svg { animation: ot-step      260ms ease-out; }
+.ot-view.anim-forward .ot-svg { animation: ot-forward   320ms ease-out; }
+.ot-view.anim-enter   .ot-svg { animation: ot-enter     340ms ease-out; }
+@keyframes ot-forward {
+  from { transform: scale(0.82) translateY(2%); opacity: 0.55; }
+  to   { transform: none; opacity: 1; }
+}
+@keyframes ot-enter {
+  from { transform: scale(0.7); opacity: 0.2; }
+  to   { transform: none; opacity: 1; }
+}
+@keyframes ot-pan-left {
+  from { transform: translateX(-26%) rotateY(20deg); opacity: 0.35; }
+  to   { transform: none; opacity: 1; }
+}
+@keyframes ot-pan-right {
+  from { transform: translateX(26%) rotateY(-20deg); opacity: 0.35; }
+  to   { transform: none; opacity: 1; }
+}
+@keyframes ot-pan-about {
+  0%   { transform: scale(1.18) rotateY(28deg); opacity: 0.15; }
+  100% { transform: none; opacity: 1; }
+}
+@keyframes ot-step {
+  from { transform: scale(1.12); opacity: 0.5; }
+  to   { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ot-view .ot-svg { animation: none !important; }
+}
+
+.ot-btn.dim { opacity: 0.35; }
+
+.ot-msg {
+  min-height: 1.4em;
+  font-weight: 700;
+  color: #fbbf24;
+  text-align: center;
+  padding: 0 12px;
+}
+
+.ot-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(94vw, 460px);
+}
+.ot-controls.done { align-items: stretch; }
+.ot-nav { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.ot-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.ot-btn {
+  font: inherit;
+  font-weight: 800;
+  font-size: 1.25rem;
+  cursor: pointer;
+  border: none;
+  border-radius: 14px;
+  padding: 14px 0;
+  color: #f8fafc;
+  background: rgba(255,255,255,0.10);
+  box-shadow: 0 4px 0 rgba(0,0,0,0.3);
+}
+.ot-btn:active { transform: translateY(3px); box-shadow: 0 1px 0 rgba(0,0,0,0.3); }
+.ot-btn.fwd { background: #38bdf8; box-shadow: 0 4px 0 #0c6fb8; }
+.ot-btn.on { background: #14b8a6; box-shadow: 0 4px 0 #0f766e; }
+.ot-actions .ot-btn { font-size: 1rem; }
+.ot-btn.collect { background: #f59e0b; box-shadow: 0 4px 0 #b45309; }
+.ot-btn.dump { background: #16a34a; box-shadow: 0 4px 0 #14532d; }
+
+/* ---- Job Site: tool belt + build ---- */
+.tool-belt { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+.tool-btn {
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+  border: 2px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.08);
+  color: #f8fafc;
+  padding: 8px 16px;
+  border-radius: 999px;
+}
+.tool-btn.active { background: #38bdf8; border-color: #38bdf8; color: #06283d; }
+.build-row { display: flex; }
+.build-row .ot-btn.build { flex: 1; background: #f59e0b; box-shadow: 0 4px 0 #b45309; }
+
+.ot-map {
+  position: absolute;
+  inset: 0;
+  background: rgba(15,23,42,0.97);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 18px;
+  z-index: 5;
+  text-align: center;
+}
+.ot-map h3 { font-size: 1.4rem; }
+.ot-map-grid { display: grid; gap: 4px; }
+.ot-cell {
+  width: clamp(20px, 8vw, 38px);
+  aspect-ratio: 1;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 800;
+  color: #cbd5e1;
+}
+.ot-cell.corridor { background: #334155; }
+.ot-cell.office { background: #475569; color: #94a3b8; }
+.ot-cell.office.trash { background: #ef4444; color: #fff; }
+.ot-cell.office.done { background: #16a34a; color: #fff; }
+.ot-cell.dumpster { background: #15803d; }
+.ot-cell.player { outline: 3px solid #fbbf24; outline-offset: -3px; color: #fbbf24; }
+
+/* ---- Shared word-puzzle styles ---- */
+.game-stage.puzzle { justify-content: flex-start; padding-top: 10px; }
+.puzzle-body {
+  width: min(96vw, 480px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+.puzzle .clue {
+  font-size: 1.05rem;
+  font-weight: 700;
+  text-align: center;
+  color: #e2e8f0;
+}
+
+/* On-screen keyboard */
+.kbd {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 5px;
+  width: min(96vw, 480px);
+}
+.kbd-key {
+  font: inherit;
+  font-weight: 800;
+  padding: 10px 0;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.12);
+  color: #f8fafc;
+  cursor: pointer;
+}
+.kbd-key:active { transform: translateY(2px); }
+.kbd-erase { grid-column: span 2; background: #f59e0b; }
+
+/* Cryptograms / Crypto-Families cells */
+.crypt-line { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 6px; }
+.crypt-word { display: flex; gap: 3px; }
+.crypt-cell {
+  width: 26px;
+  border: none;
+  background: transparent;
+  color: #f8fafc;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0;
+  font: inherit;
+}
+.crypt-cell .cg {
+  height: 28px;
+  width: 100%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.15rem; font-weight: 800;
+  border-bottom: 2px solid #64748b;
+}
+.crypt-cell .cc { font-size: 0.72rem; opacity: 0.6; margin-top: 3px; }
+.crypt-cell.sel .cg { border-color: #fbbf24; background: rgba(251,191,36,0.18); }
+.crypt-cell.given .cg { color: #38bdf8; }
+.crypt-cell.filled .cg { color: #fff; }
+
+/* Anagrams */
+.anag-slots { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.anag-slot {
+  width: 40px; height: 48px;
+  border: 2px dashed #64748b;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+  color: #f8fafc;
+  font-size: 1.4rem; font-weight: 800;
+  cursor: pointer;
+}
+.anag-slot.filled { border-style: solid; border-color: #38bdf8; background: rgba(56,189,248,0.15); }
+.anag-pool { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
+.anag-tile {
+  width: 44px; height: 52px;
+  border: none; border-radius: 10px;
+  background: linear-gradient(145deg, #38bdf8, #2563eb);
+  color: #fff; font-size: 1.5rem; font-weight: 800;
+  cursor: pointer; box-shadow: 0 3px 0 rgba(0,0,0,0.3);
+}
+.anag-tile:active { transform: translateY(2px); }
+.anag-tile.used { visibility: hidden; }
+
+/* Brick by Brick */
+.brick-wall {
+  width: 100%;
+  min-height: 56px;
+  border-radius: 10px;
+  background: rgba(0,0,0,0.25);
+  padding: 14px;
+  font-size: 1.3rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-align: center;
+  word-break: break-word;
+}
+.brick-tray { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+.brick {
+  font: inherit; font-weight: 800; font-size: 1.15rem;
+  padding: 12px 10px;
+  border: none; border-radius: 8px;
+  background: linear-gradient(145deg, #f59e0b, #b45309);
+  color: #fff; cursor: pointer;
+  box-shadow: 0 3px 0 rgba(0,0,0,0.3);
+  letter-spacing: 2px;
+}
+.brick:active { transform: translateY(2px); }
+.brick.used { visibility: hidden; }
+
+/* Quotefalls */
+.qf-pools, .qf-grid { display: grid; gap: 4px; width: min(96vw, 460px); }
+.qf-pool { display: flex; flex-direction: column; gap: 3px; align-items: center; min-height: 20px; }
+.qf-tile {
+  width: 100%; aspect-ratio: 1; max-width: 34px;
+  border: none; border-radius: 6px;
+  background: linear-gradient(145deg, #38bdf8, #2563eb);
+  color: #fff; font-weight: 800; font-size: clamp(0.8rem, 3.4vw, 1.1rem);
+  cursor: pointer;
+}
+.qf-tile.used { visibility: hidden; }
+.qf-grid { margin-top: 8px; }
+.qf-cell {
+  aspect-ratio: 1;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: clamp(0.8rem, 3.4vw, 1.1rem);
+  border-radius: 5px;
+}
+button.qf-cell {
+  border: 2px solid #475569;
+  background: rgba(255,255,255,0.04);
+  color: #fff; cursor: pointer; font: inherit; font-weight: 800;
+}
+button.qf-cell.filled { border-color: #38bdf8; background: rgba(56,189,248,0.18); }
+.qf-cell.space { background: #0f172a; }
+.qf-cell.pad { background: transparent; }
+
+.win-banner {
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: #fbbf24;
+  animation: pop-in 300ms cubic-bezier(.2,.9,.3,1.2) both;
+}
+
+/* ---- Earth: wide-screen hexel planet ----
+   Unlike the phone-narrow games, Earth fills the whole viewport (the body class is toggled by
+   mountEarth/destroy). Overlays sit on top of a full-bleed canvas. */
+body.earth-wide #app { max-width: none; }
+
+.screen.earth { overflow: hidden; }
+.earth-stage { position: relative; flex: 1; width: 100%; padding: 0; display: block; }
+.earth-view { position: absolute; inset: 0; }
+.earth-view canvas { display: block; width: 100%; height: 100%; }
+
+.earth-hud {
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+  z-index: 3; pointer-events: none;
+}
+.earth-reticle {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 2; pointer-events: none;
+  font-size: 22px; font-weight: 800; line-height: 1;
+  color: rgba(255,255,255,0.7); text-shadow: 0 0 4px rgba(0,0,0,0.6);
+}
+.earth-legend {
+  position: absolute; top: 12px; right: 12px; z-index: 3;
+  background: rgba(15,23,42,0.82); padding: 10px 14px; border-radius: 10px;
+  font-size: 0.85rem; line-height: 1.55; max-width: 220px;
+}
+.earth-legend.hidden { display: none; }
+
+.earth-belt {
+  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 3; max-width: 92vw;
+  background: rgba(15,23,42,0.78); padding: 8px 10px; border-radius: 14px;
+}
+.earth-belt .mat-btn {
+  font-size: 1.2rem; line-height: 1; cursor: pointer;
+  width: 40px; height: 36px; padding: 0;
+  border: 2px solid rgba(255,255,255,0.18);
+  border-bottom: 4px solid var(--sw, #888);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.08);
+}
+.earth-belt .mat-btn.active { border-color: #fff; background: rgba(255,255,255,0.2); }
+
+.earth-loading {
+  position: absolute; inset: 0; z-index: 4;
+  display: flex; align-items: center; justify-content: center;
+  background: #0b1220; color: #cbd5e1;
+  font-weight: 800; font-size: 1.2rem;
+}
