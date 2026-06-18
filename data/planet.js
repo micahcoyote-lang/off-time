@@ -2,14 +2,17 @@
    Data only (no Three types), mirroring data/materials.js. Material id 0 is reserved for AIR
    in the voxel grid; palette materials map to ids 1..N in order. */
 
-export const FREQ = 75;       // icosphere subdivision frequency → 10·FREQ²+2 = 56,252 columns
+export const FREQ = 100;      // icosphere subdivision frequency → 10·FREQ²+2 = 100,002 columns
 export const LAYERS = 32;     // radial voxel shells per column (build ceiling)
 export const CORE_L = 4;      // solid core boundary layer (below this is always solid core)
 export const SEA_L = 12;      // default sea level layer
 
 // ---- world scale (single source of truth; imported by planet-mesh.js + earth.js) ----
-export const R = 10;          // reference radius (sea level sits here)
-export const TH = 0.16;       // radial shell thickness per layer (≈ tile width at FREQ=75 ⇒ near-cubic)
+// "Bigger" world = more SAME-SIZE blocks → radius grows with frequency. R was raised with FREQ
+// (75→100, R 10→13.3) so the hexels stay near-cubic at ~0.16 wide instead of shrinking (which would
+// be finer detail, not a bigger planet). ~1.8× the surface area / tiles of the old R=10 world.
+export const R = 13.3;        // reference radius (sea level sits here) — sized so TH≈tile width at FREQ=100
+export const TH = 0.16;       // radial shell thickness per layer (≈ tile width at FREQ=100 ⇒ near-cubic)
 export const BASE_R = R - SEA_L * TH;            // radius at layer 0
 export const radius = (L) => BASE_R + L * TH;    // outer radius of layer L's inner edge
 export const MAX_R = radius(LAYERS);             // outermost possible surface (drives camera limits)
@@ -19,6 +22,15 @@ export const DAY_SECONDS = 480;   // real seconds for one full day/night rotatio
 export const ATM_COLOR = 0x6db3ff; // atmosphere / sky tint (earth blue; tweak for alien worlds)
 export const AO_MIN = 0.55;       // darkest ambient-occlusion factor for tucked-in vertices
 export const WATER_OPACITY = 0.62; // translucency of the water layer
+
+// ---- water look + feel ----
+export const WATER_SHALLOW = 0x4fb3c9; // coastal shelf tint (depth=0)
+export const WATER_DEEP = 0x123a6b;    // deep-basin tint (max depth)
+export const WATER_MAX_DEPTH = 8;      // water layers at which the deep tint is reached
+export const WATER_WAVE = 0.05;        // radial wave amplitude on the surface (world units)
+export const WADE_MAX = 0.45;          // water depth (world units) you can stand in before you must swim (~2-layer shelf)
+export const BODY_SUBMERGE = 0.35;     // how far the floating eye sits below the water surface when swimming
+export const SWIM_FACTOR = 0.6;        // movement-speed multiplier while in water
 
 // kind: 'terrain' (procedurally placed) | 'block' (creative building blocks).
 export const MATERIALS = [
@@ -37,6 +49,8 @@ export const MATERIALS = [
   { id: 'forest',  title: 'Forest',  emoji: '🌲', color: 0x2f5a2c, kind: 'terrain' },
   { id: 'savanna', title: 'Savanna', emoji: '🌾', color: 0xb3a24f, kind: 'terrain' },
   { id: 'tundra',  title: 'Tundra',  emoji: '🧊', color: 0x9aa890, kind: 'terrain' },
+  // innermost band: the dark/hot core you reach by mining all the way down (appended → id stays stable)
+  { id: 'core',    title: 'Core',    emoji: '🌋', color: 0x5a2e22, kind: 'terrain' },
 ];
 
 export const PLANET_TOOLS = [

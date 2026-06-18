@@ -19,14 +19,17 @@ import * as THREE from '../../assets/vendor/three.module.js';
 import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, buildPlanetChunks, cellIndex, AIR } from './planet-mesh.js';
-import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR } from '../../data/planet.js';
+import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM } from './planet-mesh.js';
+import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
+  WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR } from '../../data/planet.js';
+
+const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
 const PHI_MIN = 0.15, PHI_MAX = Math.PI - 0.15;
 const FLY_ALT_MIN = 0.8, FLY_ALT_MAX = R * 1.6;      // altitude ABOVE the local surface (not the core)
 // ---- walk mode (first-person on the surface, radial gravity) ----
 const EYE = 0.45;             // eye height above the ground (world units)
-const WALK_SPEED = 0.18;      // rad/s along the surface
+const WALK_SPEED = 0.135;     // rad/s along the surface (slowed ~×0.75 with the bigger R so a lap takes longer)
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
@@ -57,7 +60,7 @@ export function mountEarth(task) {
   const disposers = [];
   const on = (t, ty, fn, opts) => { t.addEventListener(ty, fn, opts); listeners.push([t, ty, fn, opts]); };
 
-  startTimer = setTimeout(() => { if (!cancelled) { start(); overlay.remove(); } }, 30);
+  startTimer = setTimeout(() => { if (!cancelled) start(); }, 30);   // start() removes the overlay when meshing finishes
 
   function start() {
     // ---- WebGL guard (same pattern as job-site.js) ----
@@ -158,6 +161,43 @@ export function mountEarth(task) {
     // flat column-center arrays for the hot nearest-column loop (avoids Vector3.dot overhead)
     const N = columns.length, cx = new Float32Array(N), cy = new Float32Array(N), cz = new Float32Array(N);
     for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
+
+    // ---- bucketed nearest-column index (replaces the per-frame full-N scan; key to smooth n=100) ----
+    // Group columns by chunk; a query dots the ~180 chunk centroids (cheap), picks the nearest, then
+    // scans only that chunk + chunks sharing an adjacent column (~1-2k cols) instead of all N.
+    const chunkCols = Array.from({ length: chunkCount }, () => []);
+    for (let i = 0; i < N; i++) chunkCols[columns[i].chunk].push(i);
+    const chCx = new Float32Array(chunkCount), chCy = new Float32Array(chunkCount), chCz = new Float32Array(chunkCount);
+    const chEmpty = new Uint8Array(chunkCount);
+    for (let ci = 0; ci < chunkCount; ci++) {
+      const list = chunkCols[ci];
+      if (!list.length) { chEmpty[ci] = 1; continue; }       // some buckets fall outside their face → empty
+      let sx = 0, sy = 0, sz = 0;
+      for (const id of list) { sx += cx[id]; sy += cy[id]; sz += cz[id]; }
+      const inv = 1 / (Math.hypot(sx, sy, sz) || 1);
+      chCx[ci] = sx * inv; chCy[ci] = sy * inv; chCz[ci] = sz * inv;
+    }
+    // scan set per chunk = itself + chunks sharing an adjacent column, so a query near a chunk border
+    // can't miss its true nearest. Built from real column adjacency ⇒ correct regardless of bucket shape.
+    const chunkScan = Array.from({ length: chunkCount }, (_, ci) => new Set([ci]));
+    for (let i = 0; i < N; i++) {
+      const ci = columns[i].chunk;
+      for (const nb of columns[i].neighbors) if (nb >= 0) { const cj = columns[nb].chunk; if (cj !== ci) chunkScan[ci].add(cj); }
+    }
+    const chunkScanArr = chunkScan.map((s) => [...s]);
+    function nearestColumn(hx, hy, hz) {
+      let bestChunk = -1, bd = -2;
+      for (let ci = 0; ci < chunkCount; ci++) { if (chEmpty[ci]) continue; const d = chCx[ci] * hx + chCy[ci] * hy + chCz[ci] * hz; if (d > bd) { bd = d; bestChunk = ci; } }
+      if (bestChunk < 0) return -1;
+      let best = -1, bbd = -2;
+      const scan = chunkScanArr[bestChunk];
+      for (let s = 0; s < scan.length; s++) {
+        const list = chunkCols[scan[s]];
+        for (let j = 0; j < list.length; j++) { const id = list[j], d = cx[id] * hx + cy[id] * hy + cz[id] * hz; if (d > bbd) { bbd = d; best = id; } }
+      }
+      return best;
+    }
+
     const saved = state.get('builds.earth', null);
     const compatible = saved && saved.freq === FREQ && saved.layers === LAYERS;
     let seed = saved && saved.seed != null ? saved.seed : (Math.random() * 0x7fffffff) | 0;
@@ -173,12 +213,10 @@ export function mountEarth(task) {
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
-    // ---- chunked planet meshes (rebuilt selectively on edit) ----
-    const planet = buildPlanetChunks(columns, cells, chunkCount);
+    // ---- chunked planet meshes: created EMPTY here, filled incrementally by the build loop below ----
+    const planet = buildPlanetChunks(columns, cells, chunkCount, sunDir);
     planet.meshes.forEach((m) => scene.add(m));            // solids cast/receive shadows (set in buildPlanetChunks); water is translucent
-
-    window.__earthDebug = { columns: columns.length, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
-    console.log('[earth] hex planet:', window.__earthDebug);
+    // (__earthDebug/log are set once the incremental meshing finishes — triCount is final then.)
 
     // ---- tallest peak: scan every column's surface, mark the highest with a gold beacon ----
     let peakCol = 0, peakL = 0, peakR = -1;
@@ -243,7 +281,9 @@ export function mountEarth(task) {
     }
     function doMine() {
       tool = 'mine';
-      if (!target || cells[cellIndex(target.colId, target.L)] === AIR) return;
+      if (!target) return;
+      const m = cells[cellIndex(target.colId, target.L)];
+      if (m === AIR || m === WATER) return;                // water is a liquid — not mineable
       applyEdit(target.colId, target.L, AIR);
     }
 
@@ -309,7 +349,7 @@ export function mountEarth(task) {
       } else if (camMode === 'fly') {
         camMode = 'walk';
         feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.3;   // start looking slightly down at the ground
-        renderer.domElement.requestPointerLock?.();      // mouse-look (keydown is a valid gesture)
+        renderer.domElement.requestPointerLock?.()?.catch?.(() => {});   // mouse-look; ignore reject (e.g. embedded preview)
       } else {
         camMode = 'orbit';
         if (document.pointerLockElement) document.exitPointerLock?.();
@@ -323,12 +363,26 @@ export function mountEarth(task) {
     // surface radius (top of the tallest solid cell) under a unit direction — lets fly mode hug
     // the actual terrain instead of a fixed high shell, so you can get low and "forward" reads right
     function surfaceRadiusAt(v) {
-      const vx = v.x, vy = v.y, vz = v.z;
-      let best = 0, bd = -2;
-      for (let i = 0; i < N; i++) { const d = cx[i] * vx + cy[i] * vy + cz[i] * vz; if (d > bd) { bd = d; best = i; } }
+      const best = nearestColumn(v.x, v.y, v.z);
+      if (best < 0) return radius(0);
       const base = best * LAYERS;
       for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return radius(L + 1);
       return radius(0);
+    }
+    // like surfaceRadiusAt but separates the SOLID seabed/land from the water column on top, so walk
+    // mode can wade/swim instead of standing on the water surface.
+    function groundInfo(v) {
+      const best = nearestColumn(v.x, v.y, v.z);
+      if (best < 0) return { solidR: radius(0), waterTopR: 0 };
+      const base = best * LAYERS;
+      let solidR = radius(0), waterTopR = 0, topFound = false;
+      for (let L = LAYERS - 1; L >= 0; L--) {
+        const m = cells[base + L];
+        if (m === AIR) continue;
+        if (!topFound) { topFound = true; if (m === WATER) waterTopR = radius(L + 1); }
+        if (m !== WATER) { solidR = radius(L + 1); break; }   // topmost non-water = seabed/land
+      }
+      return { solidR, waterTopR };
     }
     function placeOrbitCamera() { camSurfR = R; sph.set(camDist, camPhi, camTheta); camera.position.setFromSpherical(sph); camera.up.set(0, 1, 0); camera.lookAt(0, 0, 0); }
     function placeFlyCamera() {
@@ -362,7 +416,7 @@ export function mountEarth(task) {
       if (k === 't') { timeScale = timeScale === 1 ? 30 : 1; return; }   // fast-forward day/night
       if (k === '1') { tool = 'place'; refreshBelt(); drawHud(); return; }
       if (k === '2') { tool = 'mine'; refreshBelt(); drawHud(); return; }
-      if (k === ' ') { e.preventDefault(); if (camMode === 'walk') jump(); else tool === 'place' ? doPlace() : doMine(); return; }
+      if (k === ' ') { e.preventDefault(); if (camMode === 'walk') { keys.add(' '); jump(); } else tool === 'place' ? doPlace() : doMine(); return; }
       if ('wasdqe'.includes(k)) { keys.add(k); e.preventDefault(); }
     });
     on(window, 'keyup', (e) => keys.delete(e.key.toLowerCase()));
@@ -396,7 +450,7 @@ export function mountEarth(task) {
     });
     on(renderer.domElement, 'click', () => {
       if (camMode === 'walk') {
-        if (!pointerLocked) { renderer.domElement.requestPointerLock?.(); return; }
+        if (!pointerLocked) { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); return; }
         tool === 'place' ? doPlace() : doMine();
         return;
       }
@@ -435,9 +489,7 @@ export function mountEarth(task) {
       if (t < 0) t = (-b + sq) / 2;
       if (t < 0) return null;
       _hit.copy(_rd).multiplyScalar(t).add(_ro).normalize();   // surface direction under the crosshair
-      const hx = _hit.x, hy = _hit.y, hz = _hit.z;
-      let best = -1, bd = -2;
-      for (let i = 0; i < N; i++) { const d = cx[i] * hx + cy[i] * hy + cz[i] * hz; if (d > bd) { bd = d; best = i; } }
+      const best = nearestColumn(_hit.x, _hit.y, _hit.z);
       if (best < 0) return null;
       const base = best * LAYERS;
       for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
@@ -448,9 +500,7 @@ export function mountEarth(task) {
     // Minecraft-style: a point ~WALK_REACH along the heading → that column's topmost solid cell.
     function walkTarget() {
       _hit.copy(anchor).multiplyScalar(Math.cos(WALK_REACH)).addScaledVector(fwd, Math.sin(WALK_REACH)).normalize();
-      const hx = _hit.x, hy = _hit.y, hz = _hit.z;
-      let best = -1, bd = -2;
-      for (let i = 0; i < N; i++) { const d = cx[i] * hx + cy[i] * hy + cz[i] * hz; if (d > bd) { bd = d; best = i; } }
+      const best = nearestColumn(_hit.x, _hit.y, _hit.z);
       if (best < 0) return null;
       const base = best * LAYERS;
       for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
@@ -493,7 +543,7 @@ export function mountEarth(task) {
 
     // ---- render loop ----
     let lastT = 0, lastW = 0, lastH = 0;
-    const KROT = 1.4, KZOOM = 1.6, FLY_MOVE = 0.35, FLY_TURN = 1.3;
+    const KROT = 1.4, KZOOM = 1.6, FLY_MOVE = 0.26, FLY_TURN = 1.3;   // FLY_MOVE slowed ~×0.75 for the bigger world
     function advanceFly(dθ) {
       const c = Math.cos(dθ), s = Math.sin(dθ);
       tmpA.copy(anchor).multiplyScalar(c).addScaledVector(fwd, s);
@@ -505,7 +555,7 @@ export function mountEarth(task) {
       _sa.copy(anchor); _sf.copy(fwd);
       moveOnSphere(dir, dθ);
       if (grounded) {
-        const g = surfaceRadiusAt(anchor);
+        const g = groundInfo(anchor).solidR;               // solid seabed/land — water is not a wall
         if (g - feetR > STEP_UP) { anchor.copy(_sa); fwd.copy(_sf); }
       }
     }
@@ -538,24 +588,34 @@ export function mountEarth(task) {
         if (keys.has('q')) alt = Math.min(FLY_ALT_MAX, alt + KZOOM * 4 * dt);
         if (keys.has('e')) alt = Math.max(FLY_ALT_MIN, alt - KZOOM * 4 * dt);
         placeFlyCamera();
-      } else {                                            // walk: FP on the ground, radial gravity
-        const dθ = WALK_SPEED * dt;
+      } else {                                            // walk: FP on the ground, radial gravity, swim in water
+        const info = groundInfo(anchor);
+        const inWater = info.waterTopR > 0;
+        const swimming = inWater && info.waterTopR - info.solidR > WADE_MAX;   // too deep to stand → float
+        const dθ = WALK_SPEED * (inWater ? SWIM_FACTOR : 1) * dt;              // slower in water
         if (keys.has('w')) tryWalk(fwd, dθ);
         if (keys.has('s')) tryWalk(fwd, -dθ);
         right.crossVectors(fwd, anchor).normalize();
         if (keys.has('d')) tryWalk(right, dθ);
         if (keys.has('a')) tryWalk(right, -dθ);
-        // vertical: step up small ledges, otherwise gravity / jump
-        const ground = surfaceRadiusAt(anchor);
-        if (grounded && ground > feetR && ground - feetR <= STEP_UP) feetR = ground;
-        velR -= GRAV * dt; feetR += velR * dt;
-        if (feetR <= ground) { feetR = ground; velR = 0; grounded = true; } else grounded = false;
+        if (swimming) {                                   // buoyancy: float with the head out; Space swims up
+          const floatR = info.waterTopR - BODY_SUBMERGE;
+          if (keys.has(' ')) feetR += 1.6 * dt;            // swim up (toward the surface / out onto a ledge)
+          else feetR += (floatR - feetR) * Math.min(1, dt * 3);   // ease toward the float line
+          velR = 0; grounded = false;
+        } else {                                          // wade / walk on the solid seabed or land
+          const ground = info.solidR;
+          if (grounded && ground > feetR && ground - feetR <= STEP_UP) feetR = ground;
+          velR -= GRAV * dt; feetR += velR * dt;
+          if (feetR <= ground) { feetR = ground; velR = 0; grounded = true; } else grounded = false;
+        }
         placeWalkCamera();
       }
       camera.updateMatrixWorld();                          // refresh before raycast — lookAt() alone doesn't
       updateSun(dt);                                       // day/night rotation
       atmU.uCamPos.value.copy(camera.position);            // atmosphere/sky need the eye position
       atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
+      planet.waterUniforms.uTime.value += dt;              // animate the water surface (uSunDir is shared/live)
       shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
@@ -564,7 +624,21 @@ export function mountEarth(task) {
 
     refreshBelt();
     drawHud();
-    raf = requestAnimationFrame(frame);
+
+    // ---- non-freezing generation: fill the 180 chunk meshes a few ms/frame behind the overlay ----
+    placeOrbitCamera();                                    // position the camera so the streaming planet renders
+    atmU.uCamPos.value.copy(camera.position);
+    function buildLoop() {
+      const { done, built, total } = planet.buildNext(18);
+      overlay.textContent = `Generating planet… ${Math.round((built / total) * 100)}%`;
+      renderer.render(scene, camera);                      // chunks visibly pop in as they're built
+      if (!done) { raf = requestAnimationFrame(buildLoop); return; }
+      window.__earthDebug = { columns: columns.length, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
+      console.log('[earth] hex planet:', window.__earthDebug);
+      overlay.remove();
+      raf = requestAnimationFrame(frame);                  // hand off to the normal render loop
+    }
+    raf = requestAnimationFrame(buildLoop);
 
     disposers.push(() => {
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();

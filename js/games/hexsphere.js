@@ -122,25 +122,33 @@ export function buildHexSphere(freq) {
     columns.push({ id, center: center.clone(), boundary, neighbors, isPentagon, chunk: 0 });
   }
 
-  // ---- chunk assignment: nearest icosa face, then a quadrant within that face ----
-  // Used for partial geometry rebuilds (edit one chunk, not the whole planet) + frustum culling.
-  // SUB quadrants per face keeps chunks small as FREQ grows, so per-edit rebuilds stay snappy.
-  const SUB = 4;                                  // sub-chunks per face → 20·SUB chunks total
+  // ---- chunk assignment: nearest icosa face, then a G×G barycentric sub-grid within that face ----
+  // Used for partial geometry rebuilds (edit one chunk, not the whole planet) + frustum culling +
+  // bucketed nearest-column lookups (earth.js). Smaller chunks keep per-edit rebuilds snappy as FREQ
+  // grows. We split each face by the column's barycentric coords (toward verts B and C), which tiles
+  // the triangle evenly — unlike the old 2×2 sign quadrant, this scales to any G. (Buckets in the
+  // upper corner of the G×G grid fall outside the triangle and stay empty; harmless.)
+  const G = 3;                                    // sub-grid per face axis → 20·G·G = 180 chunks
+  const SUB = G * G;
   const faceCenters = ICO_FACES.map(([a, b, c]) =>
     ico[a].clone().add(ico[b]).add(ico[c]).normalize());
-  // (Y, X unit axes were declared above for the column tangent basis — reuse them)
-  const faceEast = faceCenters.map((fc) => new THREE.Vector3().crossVectors(fc, Math.abs(fc.y) < 0.99 ? Y : X).normalize());
-  const faceNorth = faceCenters.map((fc, i) => new THREE.Vector3().crossVectors(fc, faceEast[i]).normalize());
-  const _d = new THREE.Vector3();
+  const _v0 = new THREE.Vector3(), _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3();
   for (const col of columns) {
     let best = 0, bestDot = -2;
     for (let f = 0; f < faceCenters.length; f++) {
       const d = col.center.dot(faceCenters[f]);
       if (d > bestDot) { bestDot = d; best = f; }
     }
-    _d.copy(col.center).sub(faceCenters[best]);   // offset within the face's tangent plane
-    const q = (_d.dot(faceEast[best]) >= 0 ? 0 : 1) + (_d.dot(faceNorth[best]) >= 0 ? 0 : 2);
-    col.chunk = best * SUB + q;
+    // barycentric weights of the column center within face `best`'s triangle (A,B,C)
+    const A = ico[ICO_FACES[best][0]], B = ico[ICO_FACES[best][1]], C = ico[ICO_FACES[best][2]];
+    _v0.subVectors(B, A); _v1.subVectors(C, A); _v2.subVectors(col.center, A);
+    const d00 = _v0.dot(_v0), d01 = _v0.dot(_v1), d11 = _v1.dot(_v1), d20 = _v2.dot(_v0), d21 = _v2.dot(_v1);
+    const denom = (d00 * d11 - d01 * d01) || 1;
+    const wB = (d11 * d20 - d01 * d21) / denom;   // weight toward B
+    const wC = (d00 * d21 - d01 * d20) / denom;   // weight toward C
+    const gi = Math.max(0, Math.min(G - 1, Math.floor(wB * G)));
+    const gj = Math.max(0, Math.min(G - 1, Math.floor(wC * G)));
+    col.chunk = best * SUB + gi * G + gj;
   }
 
   return { columns, pentagonCount, chunkCount: ICO_FACES.length * SUB, vertCount: geodVerts.length, triCount: tris.length };

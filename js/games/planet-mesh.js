@@ -11,7 +11,8 @@
    radius(L+1). cell(c, L) = c * LAYERS + L. */
 
 import * as THREE from '../../assets/vendor/three.module.js';
-import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN, WATER_OPACITY } from '../../data/planet.js';
+import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN, WATER_OPACITY,
+  WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -50,30 +51,38 @@ function makeNoise(seed) {
   };
 }
 
-/* Generate the starting planet: a Uint8Array of material ids for every cell. */
+/* Generate the starting planet: a Uint8Array of material ids for every cell.
+   Two passes: (1) heightmap + biome + layered strata fill, recording each column's surface layer;
+   (2) carve ENCLOSED caves using neighbour surface heights so a cavity never breaches a cliff face
+   (the v11 see-through bug). */
 export function terrainFill(columns, seed) {
   const fbm = makeNoise(seed);
   const cells = new Uint8Array(columns.length * LAYERS);   // 0 = air everywhere by default
+  const surf = new Int16Array(columns.length);             // each column's surface layer (for the cave pass)
   const CF = 0.85, NF = 1.7, AMP = 8, HF = 2.3, CAVEF = 0.55;  // continent / detail / humidity / cave freqs
+
+  // ---- pass 1: heightmap + climate biome + layered strata (grass/biome → dirt → rock → core) ----
   for (const col of columns) {
     const c = col.center;
-    // ---- continents: a broad low-frequency mask makes a few big landmasses, plus finer detail ----
+    // continents: a broad low-frequency mask makes a few big landmasses, plus finer detail
     const cont = fbm(c.x * CF + 2.7, c.y * CF - 4.1, c.z * CF + 8.3);
     const detail = fbm(c.x * NF + 11.3, c.y * NF + 5.7, c.z * NF + 1.9);
     const lat = Math.abs(c.y);                              // 0 equator … 1 pole
-    let e = (cont - 0.52) * 3.0 + (detail - 0.5) * 1.1;     // continental shape + coastline ruggedness
-    e -= Math.pow(lat, 3) * 0.45;                           // poles trend lower (sea/ice)
-    let surf = Math.round(SEA_L + e * AMP);
-    surf = Math.max(CORE_L + 1, Math.min(LAYERS - 1, surf));
+    let e = (cont - 0.37) * 3.0 + (detail - 0.5) * 1.1;    // ~55% land (offset 0.52→0.37) + coastline ruggedness
+    e -= Math.pow(lat, 3) * 0.30;                           // poles trend lower, but gentler (0.45→0.30)
+    if (e < 0) e *= 1.8;                                    // steepen below sea level → real deep basins + shallow shelves
+    let s = Math.round(SEA_L + e * AMP);
+    s = Math.max(CORE_L + 1, Math.min(LAYERS - 1, s));
+    surf[col.id] = s;
     const base = col.id * LAYERS;
 
-    // ---- climate model → surface biome (jittered to dither hard biome borders) ----
-    const elevAbove = Math.max(0, surf - SEA_L);
+    // climate model → surface biome (jittered to dither hard biome borders)
+    const elevAbove = Math.max(0, s - SEA_L);
     const jit = (fbm(c.x * 9.0 - 1.3, c.y * 9.0 + 4.4, c.z * 9.0 - 8.8) - 0.5) * 0.12;
     const temp = Math.max(0, Math.min(1, (1 - lat * 1.15) - elevAbove * 0.045 + jit));
     const hum = Math.max(0, Math.min(1, fbm(c.x * HF - 7.1, c.y * HF + 19.3, c.z * HF - 3.7) + jit));
     let topMat;
-    if (surf <= SEA_L + 1) topMat = NUM.sand;              // shoreline / shallow seabed
+    if (s <= SEA_L + 1) topMat = NUM.sand;                 // shoreline / shallow seabed
     else if (elevAbove > 6) topMat = temp < 0.35 ? NUM.snow : NUM.rock;  // peaks: snowcap if cold, else rock
     else if (temp < 0.20) topMat = NUM.snow;              // frigid
     else if (temp < 0.40) topMat = NUM.tundra;            // cold
@@ -82,15 +91,31 @@ export function terrainFill(columns, seed) {
     else if (hum > 0.62) topMat = NUM.forest;            // wet → forest
     else topMat = NUM.grass;                             // temperate
 
-    for (let L = 0; L <= surf; L++)
-      cells[base + L] = L < surf - 3 ? NUM.stone : (L < surf ? NUM.dirt : topMat);
-    // ---- caves: carve sparse 3D-noise pockets underground (keep the surface crust intact) ----
-    for (let L = CORE_L + 1; L <= surf - 2; L++) {
+    // strata bands: surface biome on top, a dirt subsoil, the broad rock layer, then the solid core
+    for (let L = 0; L <= s; L++) {
+      cells[base + L] = L === s ? topMat
+        : L >= s - 3 ? NUM.dirt
+          : L <= CORE_L ? NUM.core
+            : NUM.stone;
+    }
+    if (s < SEA_L) {                                       // flood low columns up to sea level
+      for (let L = s + 1; L <= SEA_L; L++) cells[base + L] = NUM.water;
+    }
+  }
+
+  // ---- pass 2: carve ENCLOSED caves (sparse 3D-noise pockets, no see-through) ----
+  // Carve a subsurface cell to air only where EVERY neighbour column is taller than that layer, so
+  // the cavity is walled on all sides — never exposed on a cliff face (the v11 see-through bug where
+  // a carved cell met a lower neighbour). L ≤ s−2 keeps a ≥2-layer crust; L ≥ CORE_L+1 keeps the core
+  // solid. Caves are discovered by digging; they never open a hole to space.
+  for (const col of columns) {
+    const c = col.center, base = col.id * LAYERS, s = surf[col.id], neigh = col.neighbors, nn = neigh.length;
+    for (let L = CORE_L + 1; L <= s - 2; L++) {
+      let enclosed = true;
+      for (let k = 0; k < nn; k++) { const nb = neigh[k]; if (nb < 0 || surf[nb] <= L) { enclosed = false; break; } }
+      if (!enclosed) continue;
       const r = (radius(L) + radius(L + 1)) / 2;
       if (fbm(c.x * r * CAVEF + 30.0, c.y * r * CAVEF - 12.0, c.z * r * CAVEF + 5.0) > 0.7) cells[base + L] = AIR;
-    }
-    if (surf < SEA_L) {                                    // flood low columns up to sea level
-      for (let L = surf + 1; L <= SEA_L; L++) cells[base + L] = NUM.water;
     }
   }
   return cells;
@@ -102,6 +127,8 @@ const _ref = new THREE.Vector3();
 const _top = new THREE.Color(), _sideC = new THREE.Color(), _sideBot = new THREE.Color();
 const GRASS_NUM = NUM.grass, WATER_NUM = NUM.water, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
 const WALL_BASE_AO = 0.7;                                   // wall bottoms this fraction as bright as tops
+const WATER_SHALLOW_C = new THREE.Color(WATER_SHALLOW), WATER_DEEP_C = new THREE.Color(WATER_DEEP);
+const _wcol = new THREE.Color();                            // per-column depth-graded water tint
 
 // Per-vertex brightness from a hash of the (quantized) vertex position → a stable, seam-free
 // "texture" speckle on every hexel. Shared positions hash the same, so faces meet without seams.
@@ -137,6 +164,15 @@ function pushTri(p0, p1, p2, col, ref, positions, colors) {
 // Neighbor lookups span chunks via the global `cells`.
 function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
   const base = col.id * LAYERS, bnd = col.boundary, neigh = col.neighbors, n = bnd.length;
+  // depth-graded water tint for this column (shallow shelf → deep basin), computed once
+  let waterTop = -1, seabed = -1;
+  for (let L = LAYERS - 1; L >= 0; L--) {
+    const m = cells[base + L];
+    if (m === AIR) continue;
+    if (waterTop < 0 && m === WATER_NUM) waterTop = L;       // topmost water cell
+    if (m !== WATER_NUM) { seabed = L; break; }              // topmost solid below the water
+  }
+  if (waterTop >= 0) _wcol.copy(WATER_SHALLOW_C).lerp(WATER_DEEP_C, Math.min(1, Math.max(0, waterTop - seabed) / WATER_MAX_DEPTH));
   for (let L = 0; L < LAYERS; L++) {
     const matn = cells[base + L];
     if (matn === AIR) continue;
@@ -151,13 +187,13 @@ function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
       let walled = 0;
       for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && cells[nb * LAYERS + L + 1] !== AIR) walled++; }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
-      _top.copy(COLORS[matn]).multiplyScalar(aoTop);
+      _top.copy(matn === WATER_NUM ? _wcol : COLORS[matn]).multiplyScalar(aoTop);
       const ctr = col.center.clone().multiplyScalar(rOut);
       for (let k = 0; k < n; k++)
         pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _top, _ref, positions, colors);
     }
     // grass blocks show brown (dirt) on their sides; else darken the material; AO fades wall bottoms
-    _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
+    _sideC.copy(matn === WATER_NUM ? _wcol : (matn === GRASS_NUM ? DIRT_COL : COLORS[matn])).multiplyScalar(0.82);
     _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
@@ -170,45 +206,101 @@ function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
   }
 }
 
-/* Build the planet as `chunkCount` meshes (grouped by column.chunk). Returns a manager that
-   can rebuild individual chunks cheaply when an edit changes only a few columns. */
-export function buildPlanetChunks(columns, cells, chunkCount) {
+/* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY
+   up front (add them to the scene immediately) and filled INCREMENTALLY by buildNext() so a 100k-tile
+   planet doesn't freeze the tab — the caller drives buildNext() across frames behind a progress
+   overlay. Returns a manager that also rebuilds individual chunks cheaply when an edit changes only a
+   few columns. (Some chunk buckets fall outside their icosa face and stay empty — handled.) */
+export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
   const groups = Array.from({ length: chunkCount }, () => []);
   for (const col of columns) groups[col.chunk].push(col);
   // Lambert (cheap, diffuse-only) instead of Standard PBR — the non-indexed geometry already
   // has per-face-constant normals, so it still reads as crisp flat-shaded facets but costs far
-  // less per fragment (big win full-screen on integrated GPUs). Water is a second, translucent
-  // material rendered after the opaque solids.
+  // less per fragment (big win full-screen on integrated GPUs).
   const solidMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-  const waterMat = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, opacity: WATER_OPACITY, depthWrite: false });
 
+  // Water is a second, translucent pass with its OWN shader: per-vertex depth tint (vColor) +
+  // a gentle radial wave bob + fresnel sheen + a sun-specular glint that tracks the day/night sun.
+  // Uniforms share earth.js's live `sunDir`; the caller bumps uTime each frame. (ShaderMaterial
+  // auto-provides position/normal/matrices/cameraPosition; we declare the color attribute ourselves.)
+  const waterUniforms = {
+    uTime: { value: 0 },
+    uSunDir: { value: sunDir || new THREE.Vector3(1, 0, 0) },
+    uWave: { value: WATER_WAVE },
+    uOpacity: { value: WATER_OPACITY },
+  };
+  const waterMat = new THREE.ShaderMaterial({
+    uniforms: waterUniforms,
+    transparent: true, depthWrite: false,
+    vertexShader: `
+      attribute vec3 color; uniform float uTime, uWave;
+      varying vec3 vColor, vWorld, vNormalW;
+      void main(){
+        vColor = color;
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vec3 nrm = normalize(wp.xyz);
+        float w = sin(wp.x * 1.5 + uTime) + sin((wp.z + wp.y) * 1.5 + uTime * 1.3);
+        wp.xyz += nrm * (uWave * w * 0.5);
+        vWorld = wp.xyz; vNormalW = nrm;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader: `
+      uniform vec3 uSunDir; uniform float uOpacity;
+      varying vec3 vColor, vWorld, vNormalW;
+      void main(){
+        vec3 N = normalize(vNormalW);
+        vec3 V = normalize(cameraPosition - vWorld);
+        vec3 sun = normalize(uSunDir);
+        float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);          // grazing sheen
+        float sunEl = clamp(dot(N, sun) * 1.2 + 0.15, 0.0, 1.0);   // day/night dimming
+        vec3 R = reflect(-sun, N);
+        float spec = pow(max(dot(R, V), 0.0), 60.0);               // sharp sun glint
+        vec3 col = vColor * (0.5 + 0.5 * sunEl);
+        col += vec3(0.6, 0.75, 0.9) * fres * 0.5;                  // cool fresnel
+        col += vec3(1.0, 0.96, 0.85) * spec * sunEl;               // warm sparkle (daylight only)
+        gl_FragColor = vec4(col, clamp(uOpacity + fres * 0.3, 0.0, 1.0));
+      }`,
+  });
+
+  // disable frustum culling on empty geometry (no vertices → boundingSphere would be NaN and warn)
+  const setCull = (mesh) => { mesh.frustumCulled = (mesh.geometry.getAttribute('position')?.count || 0) > 0; };
   function fillPair(solidGeo, waterGeo, group) {
     const sP = [], sC = [], wP = [], wC = [];
     for (const col of group) emitColumn(col, cells, sP, sC, wP, wC);
     solidGeo.setAttribute('position', new THREE.Float32BufferAttribute(sP, 3));
     solidGeo.setAttribute('color', new THREE.Float32BufferAttribute(sC, 3));
-    solidGeo.computeVertexNormals(); solidGeo.computeBoundingSphere();
     waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(wP, 3));
     waterGeo.setAttribute('color', new THREE.Float32BufferAttribute(wC, 3));
-    waterGeo.computeVertexNormals(); waterGeo.computeBoundingSphere();
+    if (sP.length) { solidGeo.computeVertexNormals(); solidGeo.computeBoundingSphere(); }
+    if (wP.length) { waterGeo.computeVertexNormals(); waterGeo.computeBoundingSphere(); }
     return (sP.length + wP.length) / 9;
   }
 
   const entries = [];
-  let triCount = 0;
   for (let i = 0; i < chunkCount; i++) {
-    const solidGeo = new THREE.BufferGeometry(), waterGeo = new THREE.BufferGeometry();
-    triCount += fillPair(solidGeo, waterGeo, groups[i]);
-    const solidMesh = new THREE.Mesh(solidGeo, solidMat);
-    solidMesh.castShadow = true; solidMesh.receiveShadow = true;
-    const waterMesh = new THREE.Mesh(waterGeo, waterMat);
-    waterMesh.renderOrder = 1;                 // draw after opaque solids (transparent)
+    const solidMesh = new THREE.Mesh(new THREE.BufferGeometry(), solidMat);
+    solidMesh.castShadow = true; solidMesh.receiveShadow = true; solidMesh.frustumCulled = false;
+    const waterMesh = new THREE.Mesh(new THREE.BufferGeometry(), waterMat);
+    waterMesh.renderOrder = 1; waterMesh.frustumCulled = false;   // draw after opaque solids (transparent)
     entries.push({ group: groups[i], solidMesh, waterMesh });
   }
 
+  let next = 0, triCount = 0;
   return {
     meshes: entries.flatMap((e) => [e.solidMesh, e.waterMesh]),
-    triCount,
+    waterUniforms,                               // caller bumps uTime each frame (uSunDir is shared/live)
+    get triCount() { return triCount; },
+    // fill un-built chunks until ~timeBudgetMs has elapsed this call; returns {done, built, total}
+    buildNext(timeBudgetMs) {
+      const t0 = performance.now();
+      while (next < chunkCount) {
+        const e = entries[next++];
+        triCount += fillPair(e.solidMesh.geometry, e.waterMesh.geometry, e.group);
+        setCull(e.solidMesh); setCull(e.waterMesh);
+        if (performance.now() - t0 >= timeBudgetMs) break;
+      }
+      return { done: next >= chunkCount, built: next, total: chunkCount };
+    },
     // rebuild only the given chunk ids (a Set or array) — used after an edit
     rebuild(chunkIds) {
       for (const id of chunkIds) {
@@ -217,6 +309,7 @@ export function buildPlanetChunks(columns, cells, chunkCount) {
         const solidGeo = new THREE.BufferGeometry(), waterGeo = new THREE.BufferGeometry();
         fillPair(solidGeo, waterGeo, e.group);
         e.solidMesh.geometry = solidGeo; e.waterMesh.geometry = waterGeo;
+        setCull(e.solidMesh); setCull(e.waterMesh);
         oldS.dispose(); oldW.dispose();
       }
     },

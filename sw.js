@@ -1,7 +1,7 @@
 /* sw.js — simple offline cache for Off Time.
    Cache-first for app shell + content so it works on a car trip with no signal. */
 
-const CACHE = 'offtime-v11';
+const CACHE = 'offtime-v13';
 
 const ASSETS = [
   './',
