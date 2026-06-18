@@ -19,9 +19,9 @@ import * as THREE from '../../assets/vendor/three.module.js';
 import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM } from './planet-mesh.js';
+import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin } from './planet-mesh.js';
 import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
-  WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR } from '../../data/planet.js';
+  WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
@@ -160,9 +160,11 @@ export function mountEarth(task) {
     // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
     // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
     let columns = null, cells = null, planet = null, beacon = null;
+    let coarseMeshes = null, coarseMat = null;           // per-chunk LOD globe (hidden where fine streams in)
     let N = 0, pentagonCount = 0, chunkCount = 0;
     let cx, cy, cz, chunkCols, chCx, chCy, chCz, chEmpty, chunkScanArr;
     let peakCol = 0, peakL = 0, peakAbove = 0;
+    const activeSet = new Set();                          // fine chunk ids currently meshed (E3 streaming)
 
     // bucketed nearest-column query: ~180 chunk-centroid dots → scan that chunk + its neighbours
     // (~1-2k cols) instead of all N. Returns -1 before the world has loaded (chunkCount 0).
@@ -218,7 +220,7 @@ export function mountEarth(task) {
       }
       chunkScanArr = scanSets.map((s) => [...s]);
 
-      // planet meshes (empty; filled by the streaming `chunk` messages or the fallback buildNext loop)
+      // fine chunk meshes (created empty; meshed on demand near the camera by updateStreaming)
       planet = buildPlanetChunks(columns, cells, chunkCount, sunDir);
       planet.meshes.forEach((m) => scene.add(m));
 
@@ -251,6 +253,65 @@ export function mountEarth(task) {
         cols[i] = { id: i, center: new THREE.Vector3(d.centers[i * 3], d.centers[i * 3 + 1], d.centers[i * 3 + 2]), boundary, neighbors: neigh, chunk: d.chunk[i], isPentagon: bl === 5 };
       }
       setupWorld(cols, d.cells, d.pentagonCount, d.chunkCount);
+    }
+
+    // worker `coarse` message → the LOD globe as one low-res mesh PER CHUNK (same regions as the fine
+    // chunks). Each is shown unless its fine chunk is streamed in (updateStreaming toggles .visible), so
+    // fine detail replaces coarse exactly — no overlap, no poke-through.
+    function onCoarse(d) {
+      coarseMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+      coarseMeshes = new Array(d.chunkCount);
+      for (let i = 0; i < d.chunkCount; i++) {
+        const geo = new THREE.BufferGeometry(), p = d.pos[i], c = d.col[i];
+        geo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(c, 3));
+        if (p.length) { geo.computeVertexNormals(); geo.computeBoundingSphere(); }
+        const m = new THREE.Mesh(geo, coarseMat);
+        m.frustumCulled = p.length > 0;                  // small regional patches → frustum-cull off-screen
+        m.visible = !activeSet.has(i);                   // hidden if this region is already fine
+        coarseMeshes[i] = m; scene.add(m);
+      }
+    }
+
+    // E3 streaming: choose which fine chunks stay meshed — the patch around the surface point under the
+    // camera in fly/walk; none in orbit (the coarse globe covers the whole planet there).
+    function computeWantActive() {
+      const want = new Set();
+      if (!planet || camMode === 'orbit') return want;
+      const px = anchor.x, py = anchor.y, pz = anchor.z;
+      const alt = Math.max(0.1, camera.position.length() - camSurfR);
+      const horizon = Math.acos(Math.min(1, camSurfR / (camSurfR + alt)));   // angular distance to the horizon
+      const cosT = Math.cos(Math.min(Math.PI, horizon + STREAM_MARGIN));
+      const cand = [];
+      for (let ci = 0; ci < chunkCount; ci++) {
+        if (chEmpty[ci]) continue;
+        if (chCx[ci] * px + chCy[ci] * py + chCz[ci] * pz > cosT) cand.push(ci);
+      }
+      if (cand.length > MAX_ACTIVE_CHUNKS) {           // keep the nearest cap-many
+        cand.sort((a, b) => (chCx[b] * px + chCy[b] * py + chCz[b] * pz) - (chCx[a] * px + chCy[a] * py + chCz[a] * pz));
+        cand.length = MAX_ACTIVE_CHUNKS;
+      }
+      for (const ci of cand) want.add(ci);
+      return want;
+    }
+    // unload chunks that left the patch (cheap) + mesh newly-entered ones incrementally (budgeted).
+    function updateStreaming(budgetMs) {
+      if (!planet) return;
+      const want = computeWantActive();
+      // chunks that left the patch: unload fine, show coarse again
+      for (const id of [...activeSet]) if (!want.has(id)) {
+        planet.unload([id]); activeSet.delete(id);
+        if (coarseMeshes) coarseMeshes[id].visible = true;
+      }
+      // chunks that entered the patch: mesh fine incrementally, then hide their coarse
+      const t0 = performance.now();
+      for (const id of want) {
+        if (activeSet.has(id)) continue;
+        planet.rebuild([id]); activeSet.add(id);
+        if (coarseMeshes) coarseMeshes[id].visible = false;
+        if (performance.now() - t0 >= budgetMs) break;   // finish the rest next frame
+      }
+      if (window.__earthDebug) { window.__earthDebug.activeChunks = activeSet.size; window.__earthDebug.fineTris = planet.triCount; }
     }
 
     // ---- highlight outline (always on target) + place ghost (Place tool only) ----
@@ -290,7 +351,10 @@ export function mountEarth(task) {
     function applyEdit(colId, L, m) {
       const ci = cellIndex(colId, L);
       cells[ci] = m; edits.set(ci, m);
-      planet.rebuild(affectedChunks(colId));
+      // re-mesh only affected chunks that are currently streamed-in; others have `cells` updated and
+      // will mesh correctly when next activated.
+      const affected = [...affectedChunks(colId)].filter((id) => activeSet.has(id));
+      if (affected.length) planet.rebuild(affected);
       needsTarget = true; shadowDirty = true;             // surface height changed under the crosshair
       persist(); markTaskDone('earth'); drawHud();
     }
@@ -643,6 +707,7 @@ export function mountEarth(task) {
       shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
+      updateStreaming(6);                                  // E3: load/unload fine chunks around the camera
       renderer.render(scene, camera);
     }
 
@@ -655,12 +720,13 @@ export function mountEarth(task) {
     // freeze). Edits stay on main (local planet.rebuild). Falls back to in-main generation if Workers
     // are unavailable, so the offline PWA still works on any engine. ----
     let worker = null;
-    const onProgress = (built, total) => { overlay.textContent = `Generating planet… ${Math.round((built / total) * 100)}%`; };
     function onDone() {
-      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
+      let coarseTris = 0;
+      if (coarseMeshes) for (const m of coarseMeshes) coarseTris += (m.geometry.attributes.position?.count || 0) / 3;
+      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, coarseTris, fineTris: 0, activeChunks: 0, seed };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
-      if (worker) { worker.terminate(); worker = null; }   // its job is finished; edits re-mesh locally
+      if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand
       raf = requestAnimationFrame(frame);                  // hand off to the normal render loop
     }
     function runFallback() {                               // no Worker: generate on the main thread (E1 path)
@@ -668,11 +734,12 @@ export function mountEarth(task) {
       const localCells = terrainFill(topo.columns, seed);
       for (const [c, m] of edits) if (c >= 0 && c < localCells.length) localCells[c] = m;
       setupWorld(topo.columns, localCells, topo.pentagonCount, topo.chunkCount);
-      (function loop() {
-        const { done, built, total } = planet.buildNext(18);
-        onProgress(built, total); renderer.render(scene, camera);
-        if (done) onDone(); else raf = requestAnimationFrame(loop);
-      })();
+      const cg = buildHexSphere(FREQ_COARSE), ccells = terrainFill(cg.columns, seed);   // coarse LOD globe (per chunk)
+      const cgroups = Array.from({ length: cg.chunkCount }, () => []);
+      for (const col of cg.columns) cgroups[col.chunk].push(col);
+      const cpos = cgroups.map((g) => meshSurfaceSkin(g, ccells));
+      onCoarse({ chunkCount: cg.chunkCount, pos: cpos.map((s) => s.pos), col: cpos.map((s) => s.col) });
+      onDone();
     }
     try {
       if (typeof Worker === 'undefined') throw new Error('Worker unsupported');
@@ -681,7 +748,7 @@ export function mountEarth(task) {
       worker.onmessage = (e) => {
         const d = e.data;
         if (d.type === 'topology') onTopology(d);
-        else if (d.type === 'chunk') { if (planet) { planet.applyChunk(d.chunkId, d); onProgress(d.built, d.total); renderer.render(scene, camera); } }
+        else if (d.type === 'coarse') { onCoarse(d); renderer.render(scene, camera); }   // orbit shows the globe immediately
         else if (d.type === 'done') onDone();
       };
       worker.postMessage({ type: 'init', freq: FREQ, seed, edits: [...edits].map(([c, m]) => ({ c, m })) });
@@ -699,6 +766,7 @@ export function mountEarth(task) {
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
       if (beacon) { scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose(); }
+      if (coarseMeshes) { for (const m of coarseMeshes) { scene.remove(m); m.geometry.dispose(); } coarseMat.dispose(); }
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });

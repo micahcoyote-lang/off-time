@@ -219,6 +219,29 @@ export function meshChunkArrays(chunkColumns, cells) {
   };
 }
 
+/* Coarse LOD globe (E3): a low-resolution SURFACE SKIN of the whole planet — just each column's top
+   face (no walls / subsurface), colored by the top material. Built from a low-FREQ planet so it's a
+   few k tris and constant cost regardless of world size. Used for the orbit/space view and as the
+   distant backdrop on the surface, with full hexel chunks streamed only near the camera. */
+export function meshSurfaceSkin(columns, cells) {
+  const pos = [], col = [], _c = new THREE.Color();
+  for (const c0 of columns) {
+    const base = c0.id * LAYERS;
+    let top = -1;
+    for (let L = LAYERS - 1; L >= 0; L--) { if (cells[base + L] !== AIR) { top = L; break; } }
+    if (top < 0) continue;
+    const matn = cells[base + top], rOut = radius(top + 1);
+    if (matn === WATER_NUM) _c.copy(WATER_DEEP_C).lerp(WATER_SHALLOW_C, 0.35); else _c.copy(COLORS[matn]);
+    const bnd = c0.boundary, n = bnd.length, ctr = c0.center.clone().multiplyScalar(rOut);
+    for (let k = 0; k < n; k++)
+      pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _c, c0.center, pos, col);
+  }
+  return { pos: new Float32Array(pos), col: new Float32Array(col) };
+}
+
+const _EMPTY = new Float32Array(0);
+const EMPTY_ARRAYS = { sPos: _EMPTY, sCol: _EMPTY, wPos: _EMPTY, wCol: _EMPTY };   // for unloading a chunk
+
 /* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY
    up front (add them to the scene immediately) and filled INCREMENTALLY by buildNext() so a 100k-tile
    planet doesn't freeze the tab — the caller drives buildNext() across frames behind a progress
@@ -321,9 +344,14 @@ export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
       }
       return { done: next >= chunkCount, built: next, total: chunkCount };
     },
-    // rebuild only the given chunk ids (a Set or array), meshing LOCALLY — the per-edit path
+    // mesh / rebuild the given chunk ids (a Set or array) LOCALLY from `cells` — the on-demand
+    // streaming-activation path and the per-edit path.
     rebuild(chunkIds) {
       for (const id of chunkIds) applyToEntry(entries[id], meshChunkArrays(entries[id].group, cells));
+    },
+    // unload chunks far from the camera: swap to empty geometry + free GPU memory (E3 streaming)
+    unload(chunkIds) {
+      for (const id of chunkIds) applyToEntry(entries[id], EMPTY_ARRAYS);
     },
     dispose() {
       for (const e of entries) { e.solidMesh.geometry.dispose(); e.waterMesh.geometry.dispose(); }

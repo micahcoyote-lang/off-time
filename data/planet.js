@@ -29,6 +29,11 @@ export const WATER_DEEP = 0x123a6b;    // deep-basin tint (max depth)
 export const WATER_MAX_DEPTH = 8;      // water layers at which the deep tint is reached
 export const WATER_WAVE = 0.05;        // radial wave amplitude on the surface (world units)
 export const WADE_MAX = 0.45;          // water depth (world units) you can stand in before you must swim (~2-layer shelf)
+
+// ---- E3: LOD globe + surface chunk streaming ----
+export const FREQ_COARSE = 30;         // coarse LOD globe frequency (~9k cols → constant orbit cost, any world size)
+export const STREAM_MARGIN = 0.2;      // radians of fine-chunk patch kept beyond the horizon around the camera
+export const MAX_ACTIVE_CHUNKS = 48;   // cap on simultaneously-meshed fine chunks (memory/perf guard)
 export const BODY_SUBMERGE = 0.35;     // how far the floating eye sits below the water surface when swimming
 export const SWIM_FACTOR = 0.6;        // movement-speed multiplier while in water
 

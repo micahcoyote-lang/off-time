@@ -15,7 +15,8 @@
    This is a MODULE worker (`{type:'module'}`), so it can `import` the same ES modules the page uses. */
 
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, meshChunkArrays } from './planet-mesh.js';
+import { terrainFill, meshSurfaceSkin } from './planet-mesh.js';
+import { FREQ_COARSE } from '../../data/planet.js';
 
 self.onmessage = (e) => {
   const msg = e.data;
@@ -49,23 +50,26 @@ self.onmessage = (e) => {
       neighbors[i * 6 + k] = col.neighbors[k];
     }
   }
-  // copy cells for the transfer (we still need our own `cells` to mesh from below)
-  const cellsForMain = cells.slice();
+  // transfer the full cells grid (the main thread keeps it resident for picking + on-demand meshing).
+  // Safe to transfer the original: the coarse globe below uses its OWN low-FREQ cells, not this one.
   self.postMessage(
-    { type: 'topology', centers, boundary, boundaryLen, neighbors, chunk, cells: cellsForMain, chunkCount, pentagonCount },
-    [centers.buffer, boundary.buffer, boundaryLen.buffer, neighbors.buffer, chunk.buffer, cellsForMain.buffer],
+    { type: 'topology', centers, boundary, boundaryLen, neighbors, chunk, cells, chunkCount, pentagonCount },
+    [centers.buffer, boundary.buffer, boundaryLen.buffer, neighbors.buffer, chunk.buffer, cells.buffer],
   );
 
-  // 3. mesh each chunk and stream it (transferring the geometry buffers). The worker posts after each
-  //    chunk, so the main thread renders them progressively while later chunks are still meshing.
-  const groups = Array.from({ length: chunkCount }, () => []);
-  for (const col of columns) groups[col.chunk].push(col);
-  for (let id = 0; id < chunkCount; id++) {
-    const a = meshChunkArrays(groups[id], cells);
-    self.postMessage(
-      { type: 'chunk', chunkId: id, sPos: a.sPos, sCol: a.sCol, wPos: a.wPos, wCol: a.wCol, built: id + 1, total: chunkCount },
-      [a.sPos.buffer, a.sCol.buffer, a.wPos.buffer, a.wCol.buffer],
-    );
+  // 3. coarse LOD globe: a low-FREQ surface skin of the whole planet (same seed → continents/biomes
+  //    line up), built PER CHUNK using the same chunk regions as the fine world (chunkCount is the same,
+  //    independent of FREQ). The main thread hides a coarse chunk exactly when its fine chunk streams in
+  //    (no overlap → no poke-through), and meshes fine hexel chunks on demand near the camera.
+  const cg = buildHexSphere(FREQ_COARSE);
+  const ccells = terrainFill(cg.columns, seed);
+  const cgroups = Array.from({ length: cg.chunkCount }, () => []);
+  for (const col of cg.columns) cgroups[col.chunk].push(col);
+  const cpos = [], ccol = [], xfer = [];
+  for (let i = 0; i < cg.chunkCount; i++) {
+    const s = meshSurfaceSkin(cgroups[i], ccells);
+    cpos.push(s.pos); ccol.push(s.col); xfer.push(s.pos.buffer, s.col.buffer);
   }
+  self.postMessage({ type: 'coarse', chunkCount: cg.chunkCount, pos: cpos, col: ccol }, xfer);
   self.postMessage({ type: 'done' });
 };
