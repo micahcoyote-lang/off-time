@@ -206,6 +206,19 @@ function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
   }
 }
 
+/* Pure meshing for ONE chunk's columns → transferable Float32Arrays (no THREE.BufferGeometry, no DOM).
+   Worker-safe: this is what the Web Worker (planet-worker.js) runs to mesh chunks off the main thread,
+   and what the main thread reuses for local per-edit rebuilds. Neighbour lookups span the whole planet
+   via `cells`, so `chunkColumns` is just the columns to EMIT; `cells` is the full grid. */
+export function meshChunkArrays(chunkColumns, cells) {
+  const sP = [], sC = [], wP = [], wC = [];
+  for (const col of chunkColumns) emitColumn(col, cells, sP, sC, wP, wC);
+  return {
+    sPos: new Float32Array(sP), sCol: new Float32Array(sC),
+    wPos: new Float32Array(wP), wCol: new Float32Array(wC),
+  };
+}
+
 /* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY
    up front (add them to the scene immediately) and filled INCREMENTALLY by buildNext() so a 100k-tile
    planet doesn't freeze the tab — the caller drives buildNext() across frames behind a progress
@@ -264,17 +277,6 @@ export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
 
   // disable frustum culling on empty geometry (no vertices → boundingSphere would be NaN and warn)
   const setCull = (mesh) => { mesh.frustumCulled = (mesh.geometry.getAttribute('position')?.count || 0) > 0; };
-  function fillPair(solidGeo, waterGeo, group) {
-    const sP = [], sC = [], wP = [], wC = [];
-    for (const col of group) emitColumn(col, cells, sP, sC, wP, wC);
-    solidGeo.setAttribute('position', new THREE.Float32BufferAttribute(sP, 3));
-    solidGeo.setAttribute('color', new THREE.Float32BufferAttribute(sC, 3));
-    waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(wP, 3));
-    waterGeo.setAttribute('color', new THREE.Float32BufferAttribute(wC, 3));
-    if (sP.length) { solidGeo.computeVertexNormals(); solidGeo.computeBoundingSphere(); }
-    if (wP.length) { waterGeo.computeVertexNormals(); waterGeo.computeBoundingSphere(); }
-    return (sP.length + wP.length) / 9;
-  }
 
   const entries = [];
   for (let i = 0; i < chunkCount; i++) {
@@ -282,36 +284,46 @@ export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
     solidMesh.castShadow = true; solidMesh.receiveShadow = true; solidMesh.frustumCulled = false;
     const waterMesh = new THREE.Mesh(new THREE.BufferGeometry(), waterMat);
     waterMesh.renderOrder = 1; waterMesh.frustumCulled = false;   // draw after opaque solids (transparent)
-    entries.push({ group: groups[i], solidMesh, waterMesh });
+    entries.push({ group: groups[i], solidMesh, waterMesh, tris: 0 });
   }
 
   let next = 0, triCount = 0;
+  // swap a chunk entry's geometry to freshly-meshed buffers (from the worker, or meshed locally)
+  function applyToEntry(e, a) {
+    const sg = new THREE.BufferGeometry(), wg = new THREE.BufferGeometry();
+    sg.setAttribute('position', new THREE.BufferAttribute(a.sPos, 3));
+    sg.setAttribute('color', new THREE.BufferAttribute(a.sCol, 3));
+    wg.setAttribute('position', new THREE.BufferAttribute(a.wPos, 3));
+    wg.setAttribute('color', new THREE.BufferAttribute(a.wCol, 3));
+    if (a.sPos.length) { sg.computeVertexNormals(); sg.computeBoundingSphere(); }
+    if (a.wPos.length) { wg.computeVertexNormals(); wg.computeBoundingSphere(); }
+    const oldS = e.solidMesh.geometry, oldW = e.waterMesh.geometry;
+    e.solidMesh.geometry = sg; e.waterMesh.geometry = wg;
+    setCull(e.solidMesh); setCull(e.waterMesh);
+    oldS.dispose(); oldW.dispose();
+    const t = (a.sPos.length + a.wPos.length) / 9;
+    triCount += t - e.tris; e.tris = t;
+  }
+
   return {
     meshes: entries.flatMap((e) => [e.solidMesh, e.waterMesh]),
     waterUniforms,                               // caller bumps uTime each frame (uSunDir is shared/live)
     get triCount() { return triCount; },
-    // fill un-built chunks until ~timeBudgetMs has elapsed this call; returns {done, built, total}
+    // drop a worker-meshed chunk's buffers into its meshes (the streaming path)
+    applyChunk(chunkId, arrays) { applyToEntry(entries[chunkId], arrays); },
+    // local fallback (no Worker): mesh un-built chunks until ~timeBudgetMs elapsed; {done,built,total}
     buildNext(timeBudgetMs) {
       const t0 = performance.now();
       while (next < chunkCount) {
         const e = entries[next++];
-        triCount += fillPair(e.solidMesh.geometry, e.waterMesh.geometry, e.group);
-        setCull(e.solidMesh); setCull(e.waterMesh);
+        applyToEntry(e, meshChunkArrays(e.group, cells));
         if (performance.now() - t0 >= timeBudgetMs) break;
       }
       return { done: next >= chunkCount, built: next, total: chunkCount };
     },
-    // rebuild only the given chunk ids (a Set or array) — used after an edit
+    // rebuild only the given chunk ids (a Set or array), meshing LOCALLY — the per-edit path
     rebuild(chunkIds) {
-      for (const id of chunkIds) {
-        const e = entries[id];
-        const oldS = e.solidMesh.geometry, oldW = e.waterMesh.geometry;
-        const solidGeo = new THREE.BufferGeometry(), waterGeo = new THREE.BufferGeometry();
-        fillPair(solidGeo, waterGeo, e.group);
-        e.solidMesh.geometry = solidGeo; e.waterMesh.geometry = waterGeo;
-        setCull(e.solidMesh); setCull(e.waterMesh);
-        oldS.dispose(); oldW.dispose();
-      }
+      for (const id of chunkIds) applyToEntry(entries[id], meshChunkArrays(entries[id].group, cells));
     },
     dispose() {
       for (const e of entries) { e.solidMesh.geometry.dispose(); e.waterMesh.geometry.dispose(); }

@@ -1,7 +1,7 @@
 /* sw.js — simple offline cache for Off Time.
    Cache-first for app shell + content so it works on a car trip with no signal. */
 
-const CACHE = 'offtime-v13';
+const CACHE = 'offtime-v14';
 
 const ASSETS = [
   './',
@@ -29,6 +29,7 @@ const ASSETS = [
   './js/games/earth.js',
   './js/games/hexsphere.js',
   './js/games/planet-mesh.js',
+  './js/games/planet-worker.js',
   './js/games/continue-gate.js',
   './js/games/puzzles/_shared.js',
   './js/games/puzzles/decode-engine.js',

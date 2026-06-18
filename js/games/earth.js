@@ -33,7 +33,7 @@ const WALK_SPEED = 0.135;     // rad/s along the surface (slowed ~×0.75 with th
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
-const WALK_REACH = 2.2 / FREQ; // angular reach ahead (~2 tiles) for the "block in front" target
+const WALK_REACH = 1.3 / FREQ; // angular reach ahead (~1 tile) for the "block in front" target (tunnelling)
 
 export function mountEarth(task) {
   document.body.classList.add('earth-wide');           // lift the 480px #app cap (theme-game.css)
@@ -156,35 +156,16 @@ export function mountEarth(task) {
     const sky = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.22, 48, 32), skyMat);
     sky.frustumCulled = false; scene.add(sky);
 
-    // ---- topology + seeded terrain + saved edits (with size guard) ----
-    const { columns, pentagonCount, chunkCount } = buildHexSphere(FREQ);
-    // flat column-center arrays for the hot nearest-column loop (avoids Vector3.dot overhead)
-    const N = columns.length, cx = new Float32Array(N), cy = new Float32Array(N), cz = new Float32Array(N);
-    for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
+    // ---- world data (streamed from the worker's `topology` message; see the worker block below) ----
+    // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
+    // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
+    let columns = null, cells = null, planet = null, beacon = null;
+    let N = 0, pentagonCount = 0, chunkCount = 0;
+    let cx, cy, cz, chunkCols, chCx, chCy, chCz, chEmpty, chunkScanArr;
+    let peakCol = 0, peakL = 0, peakAbove = 0;
 
-    // ---- bucketed nearest-column index (replaces the per-frame full-N scan; key to smooth n=100) ----
-    // Group columns by chunk; a query dots the ~180 chunk centroids (cheap), picks the nearest, then
-    // scans only that chunk + chunks sharing an adjacent column (~1-2k cols) instead of all N.
-    const chunkCols = Array.from({ length: chunkCount }, () => []);
-    for (let i = 0; i < N; i++) chunkCols[columns[i].chunk].push(i);
-    const chCx = new Float32Array(chunkCount), chCy = new Float32Array(chunkCount), chCz = new Float32Array(chunkCount);
-    const chEmpty = new Uint8Array(chunkCount);
-    for (let ci = 0; ci < chunkCount; ci++) {
-      const list = chunkCols[ci];
-      if (!list.length) { chEmpty[ci] = 1; continue; }       // some buckets fall outside their face → empty
-      let sx = 0, sy = 0, sz = 0;
-      for (const id of list) { sx += cx[id]; sy += cy[id]; sz += cz[id]; }
-      const inv = 1 / (Math.hypot(sx, sy, sz) || 1);
-      chCx[ci] = sx * inv; chCy[ci] = sy * inv; chCz[ci] = sz * inv;
-    }
-    // scan set per chunk = itself + chunks sharing an adjacent column, so a query near a chunk border
-    // can't miss its true nearest. Built from real column adjacency ⇒ correct regardless of bucket shape.
-    const chunkScan = Array.from({ length: chunkCount }, (_, ci) => new Set([ci]));
-    for (let i = 0; i < N; i++) {
-      const ci = columns[i].chunk;
-      for (const nb of columns[i].neighbors) if (nb >= 0) { const cj = columns[nb].chunk; if (cj !== ci) chunkScan[ci].add(cj); }
-    }
-    const chunkScanArr = chunkScan.map((s) => [...s]);
+    // bucketed nearest-column query: ~180 chunk-centroid dots → scan that chunk + its neighbours
+    // (~1-2k cols) instead of all N. Returns -1 before the world has loaded (chunkCount 0).
     function nearestColumn(hx, hy, hz) {
       let bestChunk = -1, bd = -2;
       for (let ci = 0; ci < chunkCount; ci++) { if (chEmpty[ci]) continue; const d = chCx[ci] * hx + chCy[ci] * hy + chCz[ci] * hz; if (d > bd) { bd = d; bestChunk = ci; } }
@@ -198,39 +179,79 @@ export function mountEarth(task) {
       return best;
     }
 
+    // ---- saved seed + edits (size-guarded). The worker regenerates from `seed` and applies `edits`. ----
     const saved = state.get('builds.earth', null);
     const compatible = saved && saved.freq === FREQ && saved.layers === LAYERS;
     let seed = saved && saved.seed != null ? saved.seed : (Math.random() * 0x7fffffff) | 0;
-    const cells = terrainFill(columns, seed);
     const edits = new Map();                               // cellIndex -> material num (0 = mined to air)
     if (compatible && Array.isArray(saved.edits)) {
-      for (const ed of saved.edits) {
-        if (ed && ed.c >= 0 && ed.c < cells.length) { cells[ed.c] = ed.m; edits.set(ed.c, ed.m); }
-      }
+      for (const ed of saved.edits) if (ed && ed.c >= 0) edits.set(ed.c, ed.m);
     }
     function persist() {
       state.set('builds.earth', { v: 2, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })) });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
-    // ---- chunked planet meshes: created EMPTY here, filled incrementally by the build loop below ----
-    const planet = buildPlanetChunks(columns, cells, chunkCount, sunDir);
-    planet.meshes.forEach((m) => scene.add(m));            // solids cast/receive shadows (set in buildPlanetChunks); water is translucent
-    // (__earthDebug/log are set once the incremental meshing finishes — triCount is final then.)
-
-    // ---- tallest peak: scan every column's surface, mark the highest with a gold beacon ----
-    let peakCol = 0, peakL = 0, peakR = -1;
-    for (let i = 0; i < N; i++) {
-      const b = i * LAYERS;
-      for (let L = LAYERS - 1; L >= 0; L--) {
-        if (cells[b + L] !== AIR) { const r = radius(L + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = L; } break; }
+    // Build the picking index + planet meshes + peak beacon from ready column objects (+ cells).
+    // Shared by the worker path (reconstruct columns from flat arrays first) and the no-Worker fallback.
+    function setupWorld(cols, cellsArr, pentCount, chCount) {
+      columns = cols; cells = cellsArr; pentagonCount = pentCount; chunkCount = chCount; N = cols.length;
+      cx = new Float32Array(N); cy = new Float32Array(N); cz = new Float32Array(N);
+      for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
+      // bucketed index: per-chunk column lists + centroids + neighbour scan sets
+      chunkCols = Array.from({ length: chunkCount }, () => []);
+      for (let i = 0; i < N; i++) chunkCols[columns[i].chunk].push(i);
+      chCx = new Float32Array(chunkCount); chCy = new Float32Array(chunkCount); chCz = new Float32Array(chunkCount);
+      chEmpty = new Uint8Array(chunkCount);
+      for (let ci = 0; ci < chunkCount; ci++) {
+        const list = chunkCols[ci];
+        if (!list.length) { chEmpty[ci] = 1; continue; }       // some buckets fall outside their face → empty
+        let sx = 0, sy = 0, sz = 0;
+        for (const id of list) { sx += cx[id]; sy += cy[id]; sz += cz[id]; }
+        const inv = 1 / (Math.hypot(sx, sy, sz) || 1);
+        chCx[ci] = sx * inv; chCy[ci] = sy * inv; chCz[ci] = sz * inv;
       }
+      const scanSets = Array.from({ length: chunkCount }, (_, ci) => new Set([ci]));
+      for (let i = 0; i < N; i++) {
+        const ci = columns[i].chunk;
+        for (const nb of columns[i].neighbors) if (nb >= 0) { const cj = columns[nb].chunk; if (cj !== ci) scanSets[ci].add(cj); }
+      }
+      chunkScanArr = scanSets.map((s) => [...s]);
+
+      // planet meshes (empty; filled by the streaming `chunk` messages or the fallback buildNext loop)
+      planet = buildPlanetChunks(columns, cells, chunkCount, sunDir);
+      planet.meshes.forEach((m) => scene.add(m));
+
+      // tallest peak → gold beacon
+      let peakR = -1;
+      for (let i = 0; i < N; i++) {
+        const b = i * LAYERS;
+        for (let L = LAYERS - 1; L >= 0; L--) {
+          if (cells[b + L] !== AIR) { const r = radius(L + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = L; } break; }
+        }
+      }
+      peakAbove = peakL + 1 - SEA_L;
+      beacon = new THREE.Mesh(new THREE.ConeGeometry(0.18, 2.2, 8), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
+      beacon.position.copy(columns[peakCol].center).multiplyScalar(peakR + 1.1);
+      beacon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), columns[peakCol].center);   // point outward (radial)
+      beacon.frustumCulled = false; scene.add(beacon);
+      drawHud();
     }
-    const peakAbove = peakL + 1 - SEA_L;                    // layers above sea level (the "height")
-    const beacon = new THREE.Mesh(new THREE.ConeGeometry(0.18, 2.2, 8), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
-    beacon.position.copy(columns[peakCol].center).multiplyScalar(peakR + 1.1);
-    beacon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), columns[peakCol].center);   // point outward (radial)
-    beacon.frustumCulled = false; scene.add(beacon);
+    // worker `topology` message → reconstruct lightweight column objects, then set up the world.
+    // `d.cells` already has the saved edits applied (the worker did it).
+    function onTopology(d) {
+      const n = d.boundaryLen.length, cols = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const bl = d.boundaryLen[i], boundary = new Array(bl), neigh = new Array(bl);
+        for (let k = 0; k < bl; k++) {
+          const o = (i * 6 + k) * 3;
+          boundary[k] = new THREE.Vector3(d.boundary[o], d.boundary[o + 1], d.boundary[o + 2]);
+          neigh[k] = d.neighbors[i * 6 + k];
+        }
+        cols[i] = { id: i, center: new THREE.Vector3(d.centers[i * 3], d.centers[i * 3 + 1], d.centers[i * 3 + 2]), boundary, neighbors: neigh, chunk: d.chunk[i], isPentagon: bl === 5 };
+      }
+      setupWorld(cols, d.cells, d.pentagonCount, d.chunkCount);
+    }
 
     // ---- highlight outline (always on target) + place ghost (Place tool only) ----
     const hiMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7, depthTest: false });
@@ -292,7 +313,7 @@ export function mountEarth(task) {
       const m = MATERIALS[matIdx];
       const mode = camMode === 'fly' ? '🛩️ Fly' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
       hud.innerHTML =
-        `<span class="chip">🌍 ${columns.length}</span>` +
+        `<span class="chip">🌍 ${columns ? columns.length : 0}</span>` +
         `<span class="chip">${tool === 'place' ? '🧱 Place' : '⛏️ Mine'}</span>` +
         `<span class="chip">${m.emoji} ${m.title}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
@@ -496,14 +517,17 @@ export function mountEarth(task) {
       return null;
     }
 
-    // walk targets the block directly AHEAD of the player (independent of look pitch),
-    // Minecraft-style: a point ~WALK_REACH along the heading → that column's topmost solid cell.
+    // walk targets the block directly AHEAD of the player (independent of look pitch), Minecraft-style:
+    // a point ~WALK_REACH along the heading → the column there. We pick the highest solid cell AT OR
+    // BELOW the player's head, so you break the wall in front of you (dig a tunnel) instead of only the
+    // surface above. On flat ground that's still the block at your feet ahead (head is a few layers up).
     function walkTarget() {
       _hit.copy(anchor).multiplyScalar(Math.cos(WALK_REACH)).addScaledVector(fwd, Math.sin(WALK_REACH)).normalize();
       const best = nearestColumn(_hit.x, _hit.y, _hit.z);
       if (best < 0) return null;
       const base = best * LAYERS;
-      for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
+      const headL = Math.min(LAYERS - 1, Math.floor(((feetR + EYE) - radius(0)) / TH));   // layer at the eye
+      for (let L = headL; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
       return null;
     }
 
@@ -624,31 +648,57 @@ export function mountEarth(task) {
 
     refreshBelt();
     drawHud();
-
-    // ---- non-freezing generation: fill the 180 chunk meshes a few ms/frame behind the overlay ----
     placeOrbitCamera();                                    // position the camera so the streaming planet renders
     atmU.uCamPos.value.copy(camera.position);
-    function buildLoop() {
-      const { done, built, total } = planet.buildNext(18);
-      overlay.textContent = `Generating planet… ${Math.round((built / total) * 100)}%`;
-      renderer.render(scene, camera);                      // chunks visibly pop in as they're built
-      if (!done) { raf = requestAnimationFrame(buildLoop); return; }
-      window.__earthDebug = { columns: columns.length, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
+
+    // ---- generation: a Web Worker builds the world OFF-THREAD and STREAMS it in (no main-thread
+    // freeze). Edits stay on main (local planet.rebuild). Falls back to in-main generation if Workers
+    // are unavailable, so the offline PWA still works on any engine. ----
+    let worker = null;
+    const onProgress = (built, total) => { overlay.textContent = `Generating planet… ${Math.round((built / total) * 100)}%`; };
+    function onDone() {
+      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, tris: planet.triCount, seed };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
+      if (worker) { worker.terminate(); worker = null; }   // its job is finished; edits re-mesh locally
       raf = requestAnimationFrame(frame);                  // hand off to the normal render loop
     }
-    raf = requestAnimationFrame(buildLoop);
+    function runFallback() {                               // no Worker: generate on the main thread (E1 path)
+      const topo = buildHexSphere(FREQ);
+      const localCells = terrainFill(topo.columns, seed);
+      for (const [c, m] of edits) if (c >= 0 && c < localCells.length) localCells[c] = m;
+      setupWorld(topo.columns, localCells, topo.pentagonCount, topo.chunkCount);
+      (function loop() {
+        const { done, built, total } = planet.buildNext(18);
+        onProgress(built, total); renderer.render(scene, camera);
+        if (done) onDone(); else raf = requestAnimationFrame(loop);
+      })();
+    }
+    try {
+      if (typeof Worker === 'undefined') throw new Error('Worker unsupported');
+      worker = new Worker(new URL('./planet-worker.js', import.meta.url), { type: 'module' });
+      worker.onerror = () => { if (worker) { worker.terminate(); worker = null; } if (!planet) runFallback(); };
+      worker.onmessage = (e) => {
+        const d = e.data;
+        if (d.type === 'topology') onTopology(d);
+        else if (d.type === 'chunk') { if (planet) { planet.applyChunk(d.chunkId, d); onProgress(d.built, d.total); renderer.render(scene, camera); } }
+        else if (d.type === 'done') onDone();
+      };
+      worker.postMessage({ type: 'init', freq: FREQ, seed, edits: [...edits].map(([c, m]) => ({ c, m })) });
+    } catch (err) {
+      console.warn('[earth] worker unavailable, building on the main thread:', err);
+      runFallback();
+    }
 
     disposers.push(() => {
+      if (worker) { worker.terminate(); worker = null; }
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();
-      planet.meshes.forEach((m) => scene.remove(m));
-      planet.dispose();
+      if (planet) { planet.meshes.forEach((m) => scene.remove(m)); planet.dispose(); }
       scene.remove(highlight); hiGeo.dispose(); hiMat.dispose();
       scene.remove(ghost); ghostGeo.dispose(); ghostMat.dispose();
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
-      scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose();
+      if (beacon) { scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose(); }
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });
