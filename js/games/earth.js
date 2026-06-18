@@ -33,7 +33,6 @@ const WALK_SPEED = 1.8 / R;   // ~1.8 world-units/s along the surface (angular =
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
-const WALK_REACH = 1.3 / FREQ; // angular reach ahead (~1 tile) for the "block in front" target (tunnelling)
 
 export function mountEarth(task) {
   document.body.classList.add('earth-wide');           // lift the 480px #app cap (theme-game.css)
@@ -332,16 +331,10 @@ export function mountEarth(task) {
     let tool = 'place';                                   // 'place' | 'mine'
     let matIdx = MATERIALS.findIndex((m) => m.id === 'grass'); if (matIdx < 0) matIdx = 0;
     const matNum = () => matIdx + 1;                       // numeric id (0 = air)
-    let target = null;                                    // { colId, L } topmost solid cell under crosshair
+    let target = null;                                    // { colId, L, placeColId, placeL } from raycastVoxel
     let needsTarget = true;                               // recompute target this frame (set on edit)
     let shadowDirty = true, shadowAcc = 0;                // refresh shadow map on edits + a few times/sec
 
-    // a Place stacks on top of the targeted column's surface cell
-    function placementCell(tg) {
-      if (!tg) return null;
-      const L = tg.L + 1;
-      return L < LAYERS ? { colId: tg.colId, L } : null;
-    }
     // chunks whose geometry an edit at `colId` can change (its own + cross-chunk neighbors)
     function affectedChunks(colId) {
       const s = new Set([columns[colId].chunk]);
@@ -360,9 +353,9 @@ export function mountEarth(task) {
     }
     function doPlace() {
       tool = 'place';
-      const pc = placementCell(target);
-      if (!pc || cells[cellIndex(pc.colId, pc.L)] !== AIR) return;
-      applyEdit(pc.colId, pc.L, matNum());
+      if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
+      if (cells[cellIndex(target.placeColId, target.placeL)] !== AIR) return;
+      applyEdit(target.placeColId, target.placeL, matNum());
     }
     function doMine() {
       tool = 'mine';
@@ -548,10 +541,10 @@ export function mountEarth(task) {
       else alt = Math.max(FLY_ALT_MIN, Math.min(FLY_ALT_MAX, alt * f));
     }, { passive: false });
 
-    // ---- analytic targeting (no per-frame mesh raycast) ----
+    // ---- voxel raycast targeting ("laser"): march the crosshair ray through the voxel cells ----
     const raycaster = new THREE.Raycaster();
     const CENTER = new THREE.Vector2(0, 0);
-    const _ro = new THREE.Vector3(), _rd = new THREE.Vector3(), _hit = new THREE.Vector3();
+    const _ro = new THREE.Vector3(), _rd = new THREE.Vector3(), _p = new THREE.Vector3();
     // skip the per-frame targeting scan when the camera hasn't moved
     let cpx = NaN, cpy = 0, cpz = 0, cqx = 0, cqy = 0, cqz = 0, cqw = 0;
     function cameraMoved() {
@@ -559,45 +552,44 @@ export function mountEarth(task) {
       if (p.x === cpx && p.y === cpy && p.z === cpz && q.x === cqx && q.y === cqy && q.z === cqz && q.w === cqw) return false;
       cpx = p.x; cpy = p.y; cpz = p.z; cqx = q.x; cqy = q.y; cqz = q.z; cqw = q.w; return true;
     }
-    function analyticTarget() {
+    // March the crosshair ray through the radial voxel grid and return the FIRST solid cell (mine
+    // target) + the last air cell before it (place target). Works in every mode and follows the look
+    // direction, so you dig exactly where you point. To skip empty space, the march starts at the
+    // MAX_R shell entry (when the camera is outside) rather than at the far camera.
+    const _base0 = radius(0), _STEP = TH * 0.5;
+    function raycastVoxel() {
       raycaster.setFromCamera(CENTER, camera);
       _ro.copy(raycaster.ray.origin); _rd.copy(raycaster.ray.direction);
-      // Intersect the crosshair ray with a sphere at the locally-relevant surface radius
-      // (camSurfR, set per camera mode). Use the SMALLEST POSITIVE root so it works whether the
-      // camera is OUTSIDE the sphere (orbit → near/entry hit) or INSIDE it (fly/walk → forward
-      // hit). The old code used MAX_R + the near root only, which returned null when the camera
-      // sat inside the shell — so place/mine silently did nothing in fly and walk.
-      const b = 2 * _ro.dot(_rd), cc = _ro.dot(_ro) - camSurfR * camSurfR, disc = b * b - 4 * cc;
-      if (disc < 0) return null;
-      const sq = Math.sqrt(disc);
-      let t = (-b - sq) / 2;
-      if (t < 0) t = (-b + sq) / 2;
-      if (t < 0) return null;
-      _hit.copy(_rd).multiplyScalar(t).add(_ro).normalize();   // surface direction under the crosshair
-      const best = nearestColumn(_hit.x, _hit.y, _hit.z);
-      if (best < 0) return null;
-      const base = best * LAYERS;
-      for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
-      return null;
-    }
-
-    // walk targets the block directly AHEAD of the player (independent of look pitch), Minecraft-style:
-    // a point ~WALK_REACH along the heading → the column there. We pick the highest solid cell AT OR
-    // BELOW the player's head, so you break the wall in front of you (dig a tunnel) instead of only the
-    // surface above. On flat ground that's still the block at your feet ahead (head is a few layers up).
-    function walkTarget() {
-      _hit.copy(anchor).multiplyScalar(Math.cos(WALK_REACH)).addScaledVector(fwd, Math.sin(WALK_REACH)).normalize();
-      const best = nearestColumn(_hit.x, _hit.y, _hit.z);
-      if (best < 0) return null;
-      const base = best * LAYERS;
-      const headL = Math.min(LAYERS - 1, Math.floor(((feetR + EYE) - radius(0)) / TH));   // layer at the eye
-      for (let L = headL; L >= 0; L--) if (cells[base + L] !== AIR) return { colId: best, L };
+      const r0 = _ro.length();
+      let t0 = 0;
+      if (r0 > MAX_R) {                                     // outside the shell → jump to the near entry
+        const b = 2 * _ro.dot(_rd), cc = r0 * r0 - MAX_R * MAX_R, disc = b * b - 4 * cc;
+        if (disc < 0) return null;
+        t0 = (-b - Math.sqrt(disc)) / 2;
+        if (t0 < 0) return null;                            // shell is behind the camera
+      }
+      const tEnd = t0 + MAX_R * 2;                          // generous reach; the march breaks earlier
+      let prevCol = -1, prevL = -1;                         // last air cell = placement target
+      for (let t = t0 + 1e-4; t <= tEnd; t += _STEP) {
+        _p.copy(_rd).multiplyScalar(t).add(_ro);
+        const r = _p.length();
+        if (r > MAX_R) { if (t > t0 + _STEP) break; else continue; }   // exited the shell
+        if (r < _base0) break;                              // reached the solid core
+        const inv = 1 / r, col = nearestColumn(_p.x * inv, _p.y * inv, _p.z * inv);
+        if (col < 0) continue;
+        let L = Math.floor((r - _base0) / TH);
+        if (L < 0) L = 0; else if (L >= LAYERS) L = LAYERS - 1;
+        if (cells[col * LAYERS + L] !== AIR) return { colId: col, L, placeColId: prevCol, placeL: prevL };
+        prevCol = col; prevL = L;
+      }
       return null;
     }
 
     let lastTargetKey = '', lastGhostKey = '';
     function updateTargeting() {
-      target = camMode === 'walk' ? walkTarget() : analyticTarget();
+      target = raycastVoxel();
+      debugTarget();
+      // highlight outlines the hit (mine) cell
       const tkey = target ? `${target.colId},${target.L}` : '';
       if (tkey !== lastTargetKey) {
         lastTargetKey = tkey;
@@ -616,18 +608,18 @@ export function mountEarth(task) {
       }
       if (target) hiMat.color.setHex(tool === 'mine' ? 0xfca5a5 : 0xffffff);
 
-      if (tool !== 'place' || !target) { ghost.visible = false; lastGhostKey = ''; return; }
-      const pc = placementCell(target);
-      const valid = pc && cells[cellIndex(pc.colId, pc.L)] === AIR;
+      // ghost previews the place cell (the air cell the ray last passed through, adjacent to the hit face)
+      if (tool !== 'place' || !target || target.placeColId < 0) { ghost.visible = false; lastGhostKey = ''; return; }
+      const valid = cells[cellIndex(target.placeColId, target.placeL)] === AIR;
       ghostMat.color.setHex(valid ? 0x4ade80 : 0xf87171);
-      const cell = pc || target;
-      const gkey = `${cell.colId},${cell.L}`;
+      const gkey = `${target.placeColId},${target.placeL}`;
       if (gkey !== lastGhostKey) {
         lastGhostKey = gkey;
-        ghostGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(columns[cell.colId], cell.L), 3));
+        ghostGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(columns[target.placeColId], target.placeL), 3));
       }
       ghost.visible = true;
     }
+    const debugTarget = () => (window.__earthDebug ? (window.__earthDebug.target = target && { c: target.colId, L: target.L, pc: target.placeColId, pL: target.placeL }) : 0);
 
     // ---- render loop ----
     let lastT = 0, lastW = 0, lastH = 0;
