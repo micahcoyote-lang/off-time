@@ -118,6 +118,35 @@ export function terrainFill(columns, seed) {
       if (fbm(c.x * r * CAVEF + 30.0, c.y * r * CAVEF - 12.0, c.z * r * CAVEF + 5.0) > 0.7) cells[base + L] = AIR;
     }
   }
+
+  // ---- pass 3: structures — stamp trees on the surface, density by biome (deterministic per seed) ----
+  // A tree = a `wood` trunk + a `leaves` cap, with a 1-ring leaf canopy spilling into neighbour columns'
+  // air. Tall trunks keep canopies above head height so you can walk under them; trunks are solid (walk
+  // obstacle + mineable). Peaks grow no trees (rock/snow biomes), so the tallest-peak beacon is unaffected.
+  const WOOD = NUM.wood, LEAF = NUM.leaves;
+  const thash = (i) => { let h = Math.imul((seed ^ i) >>> 0, 2246822519); h ^= h >>> 13; h = Math.imul(h, 3266489917); h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+  for (const col of columns) {
+    const s = surf[col.id];
+    if (s <= SEA_L) continue;                              // land above sea only
+    const base = col.id * LAYERS, topM = cells[base + s];
+    let density;
+    if (topM === NUM.forest) density = 0.32;               // forest — dense
+    else if (topM === NUM.grass) density = 0.10;           // grass — scattered
+    else if (topM === NUM.savanna) density = 0.05;         // savanna — sparse
+    else continue;                                         // none on sand/snow/tundra/rock/peaks
+    if (thash(col.id) > density) continue;
+    const trunkH = 5 + (thash(col.id + 7919) < 0.5 ? 0 : 2);     // 5 or 7 tall (canopy above head)
+    for (let L = s + 1; L <= s + trunkH && L < LAYERS; L++) if (cells[base + L] === AIR) cells[base + L] = WOOD;
+    const cap = Math.min(LAYERS - 1, s + trunkH);          // leaf cap + a 1-ring canopy into neighbours' air
+    for (let L = cap - 1; L <= cap + 1 && L < LAYERS; L++) {
+      if (L >= 0 && cells[base + L] === AIR) cells[base + L] = LEAF;
+      const neigh = col.neighbors;
+      for (let k = 0; k < neigh.length; k++) {
+        const nb = neigh[k];
+        if (nb >= 0 && L >= 0 && cells[nb * LAYERS + L] === AIR) cells[nb * LAYERS + L] = LEAF;
+      }
+    }
+  }
   return cells;
 }
 

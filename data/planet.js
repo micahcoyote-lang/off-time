@@ -56,6 +56,7 @@ export const MATERIALS = [
   { id: 'tundra',  title: 'Tundra',  emoji: '🧊', color: 0x9aa890, kind: 'terrain' },
   // innermost band: the dark/hot core you reach by mining all the way down (appended → id stays stable)
   { id: 'core',    title: 'Core',    emoji: '🌋', color: 0x5a2e22, kind: 'terrain' },
+  { id: 'leaves',  title: 'Leaves',  emoji: '🍃', color: 0x4a9d3a, kind: 'block' },   // tree canopy
 ];
 
 export const PLANET_TOOLS = [
