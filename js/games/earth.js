@@ -32,6 +32,8 @@ const EYE = 0.45;             // eye height above the ground (world units)
 const WALK_SPEED = 1.8 / R;   // ~1.8 world-units/s along the surface (angular = linear/R, so a bigger planet takes proportionally longer to cross)
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
+const STEP_LAYERS = Math.max(1, Math.round(STEP_UP / TH));   // step-up ceiling in layers, for the floor scan
+const BODY_LAYERS = Math.max(2, Math.ceil(EYE / TH));        // air layers needed above the floor to fit (head clearance)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
 
 export function mountEarth(task) {
@@ -258,7 +260,7 @@ export function mountEarth(task) {
     // chunks). Each is shown unless its fine chunk is streamed in (updateStreaming toggles .visible), so
     // fine detail replaces coarse exactly — no overlap, no poke-through.
     function onCoarse(d) {
-      coarseMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+      coarseMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });   // DoubleSide so a deep hole doesn't see sky under the globe's edge
       coarseMeshes = new Array(d.chunkCount);
       for (let i = 0; i < d.chunkCount; i++) {
         const geo = new THREE.BufferGeometry(), p = d.pos[i], c = d.col[i];
@@ -447,20 +449,31 @@ export function mountEarth(task) {
       for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return radius(L + 1);
       return radius(0);
     }
-    // like surfaceRadiusAt but separates the SOLID seabed/land from the water column on top, so walk
-    // mode can wade/swim instead of standing on the water surface.
-    function groundInfo(v) {
+    // The floor under the player at direction `v`, given their current feet radius `fromR`. Finds the
+    // highest solid (non-water) cell AT OR JUST BELOW the step-up ceiling — so you can stand INSIDE a
+    // pit / tunnel / cave (a floor below the surface) instead of being snapped up to the topmost
+    // surface. Also reports the water surface (for wade/swim) and whether the body fits above the floor
+    // (head clearance) so you can't walk into a too-short gap.
+    function groundInfo(v, fromR) {
       const best = nearestColumn(v.x, v.y, v.z);
-      if (best < 0) return { solidR: radius(0), waterTopR: 0 };
+      if (best < 0) return { solidR: radius(0), waterTopR: 0, headroom: true };
       const base = best * LAYERS;
-      let solidR = radius(0), waterTopR = 0, topFound = false;
-      for (let L = LAYERS - 1; L >= 0; L--) {
+      const Lf = Math.max(0, Math.floor((fromR - radius(0)) / TH));
+      const ceilL = Math.min(LAYERS - 1, Lf + STEP_LAYERS);
+      let floorL = -1, waterTopR = 0;
+      for (let L = ceilL; L >= 0; L--) {
         const m = cells[base + L];
         if (m === AIR) continue;
-        if (!topFound) { topFound = true; if (m === WATER) waterTopR = radius(L + 1); }
-        if (m !== WATER) { solidR = radius(L + 1); break; }   // topmost non-water = seabed/land
+        if (m === WATER) { if (waterTopR === 0) waterTopR = radius(L + 1); continue; }
+        floorL = L; break;                                    // highest solid at/below the step-up ceiling
       }
-      return { solidR, waterTopR };
+      const solidR = floorL < 0 ? radius(0) : radius(floorL + 1);
+      let headroom = true;                                    // body cells above the floor must be air/water
+      for (let L = floorL + 1; L <= floorL + BODY_LAYERS && L < LAYERS; L++) {
+        const m = cells[base + L];
+        if (m !== AIR && m !== WATER) { headroom = false; break; }
+      }
+      return { solidR, waterTopR, headroom };
     }
     function placeOrbitCamera() { camSurfR = R; sph.set(camDist, camPhi, camTheta); camera.position.setFromSpherical(sph); camera.up.set(0, 1, 0); camera.lookAt(0, 0, 0); }
     function placeFlyCamera() {
@@ -473,6 +486,7 @@ export function mountEarth(task) {
     }
     function placeWalkCamera() {
       camSurfR = feetR;
+      if (window.__earthDebug) window.__earthDebug.feetR = +feetR.toFixed(3);
       camera.up.copy(anchor);
       camera.position.copy(anchor).multiplyScalar(feetR + EYE);
       // look = heading (fwd) tilted up/down by wpitch toward local up (anchor)
@@ -635,8 +649,8 @@ export function mountEarth(task) {
       _sa.copy(anchor); _sf.copy(fwd);
       moveOnSphere(dir, dθ);
       if (grounded) {
-        const g = groundInfo(anchor).solidR;               // solid seabed/land — water is not a wall
-        if (g - feetR > STEP_UP) { anchor.copy(_sa); fwd.copy(_sf); }
+        const g = groundInfo(anchor, feetR);               // floor below the feet (not the topmost surface)
+        if (!g.headroom || g.solidR - feetR > STEP_UP) { anchor.copy(_sa); fwd.copy(_sf); }   // wall or no head clearance
       }
     }
     function frame(t) {
@@ -669,7 +683,7 @@ export function mountEarth(task) {
         if (keys.has('e')) alt = Math.max(FLY_ALT_MIN, alt - KZOOM * 4 * dt);
         placeFlyCamera();
       } else {                                            // walk: FP on the ground, radial gravity, swim in water
-        const info = groundInfo(anchor);
+        const info = groundInfo(anchor, feetR);
         const inWater = info.waterTopR > 0;
         const swimming = inWater && info.waterTopR - info.solidR > WADE_MAX;   // too deep to stand → float
         const dθ = WALK_SPEED * (inWater ? SWIM_FACTOR : 1) * dt;              // slower in water
