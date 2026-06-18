@@ -52,7 +52,9 @@ export function buildHexSphere(freq) {
   // ---- 1. subdivide every face, deduping shared edge/corner vertices by position hash ----
   const geodVerts = [];               // Vector3[]
   const vmap = new Map();             // "x,y,z" -> vertex id
-  const keyOf = (v) => `${v.x.toFixed(5)},${v.y.toFixed(5)},${v.z.toFixed(5)}`;
+  // rounded-INTEGER key (5-dp dedup) — far cheaper than toFixed string formatting, which was the
+  // generation bottleneck (~4M inserts at FREQ 290). Same dedup precision, a fraction of the cost.
+  const keyOf = (v) => `${Math.round(v.x * 1e5)},${Math.round(v.y * 1e5)},${Math.round(v.z * 1e5)}`;
   function addVert(v) {
     const k = keyOf(v);
     let id = vmap.get(k);
@@ -128,7 +130,7 @@ export function buildHexSphere(freq) {
   // grows. We split each face by the column's barycentric coords (toward verts B and C), which tiles
   // the triangle evenly — unlike the old 2×2 sign quadrant, this scales to any G. (Buckets in the
   // upper corner of the G×G grid fall outside the triangle and stay empty; harmless.)
-  const G = 3;                                    // sub-grid per face axis → 20·G·G = 180 chunks
+  const G = 6;                                    // sub-grid per face axis → 20·G·G = 720 chunks (E4: 3→6 keeps cols/chunk ~constant at 4× tiles)
   const SUB = G * G;
   const faceCenters = ICO_FACES.map(([a, b, c]) =>
     ico[a].clone().add(ico[b]).add(ico[c]).normalize());
