@@ -2,7 +2,7 @@
    Data only (no Three types), mirroring data/materials.js. Material id 0 is reserved for AIR
    in the voxel grid; palette materials map to ids 1..N in order. */
 
-export const FREQ = 100;      // icosphere subdivision frequency → 10·FREQ²+2 = 100,002 columns
+export const FREQ = 145;      // icosphere subdivision frequency → 10·FREQ²+2 = 210,252 columns (~2.1× bigger)
 export const LAYERS = 32;     // radial voxel shells per column (build ceiling)
 export const CORE_L = 4;      // solid core boundary layer (below this is always solid core)
 export const SEA_L = 12;      // default sea level layer
@@ -11,7 +11,7 @@ export const SEA_L = 12;      // default sea level layer
 // "Bigger" world = more SAME-SIZE blocks → radius grows with frequency. R was raised with FREQ
 // (75→100, R 10→13.3) so the hexels stay near-cubic at ~0.16 wide instead of shrinking (which would
 // be finer detail, not a bigger planet). ~1.8× the surface area / tiles of the old R=10 world.
-export const R = 13.3;        // reference radius (sea level sits here) — sized so TH≈tile width at FREQ=100
+export const R = 19.3;        // reference radius (sea level sits here) — scaled with FREQ so TH≈tile width (near-cubic, same block size; bigger world)
 export const TH = 0.16;       // radial shell thickness per layer (≈ tile width at FREQ=100 ⇒ near-cubic)
 export const BASE_R = R - SEA_L * TH;            // radius at layer 0
 export const radius = (L) => BASE_R + L * TH;    // outer radius of layer L's inner edge

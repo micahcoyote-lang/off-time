@@ -29,7 +29,7 @@ const PHI_MIN = 0.15, PHI_MAX = Math.PI - 0.15;
 const FLY_ALT_MIN = 0.8, FLY_ALT_MAX = R * 1.6;      // altitude ABOVE the local surface (not the core)
 // ---- walk mode (first-person on the surface, radial gravity) ----
 const EYE = 0.45;             // eye height above the ground (world units)
-const WALK_SPEED = 0.135;     // rad/s along the surface (slowed ~×0.75 with the bigger R so a lap takes longer)
+const WALK_SPEED = 1.8 / R;   // ~1.8 world-units/s along the surface (angular = linear/R, so a bigger planet takes proportionally longer to cross)
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const MOUSE_SENS = 0.0024;    // pointer-lock look sensitivity
@@ -567,7 +567,7 @@ export function mountEarth(task) {
 
     // ---- render loop ----
     let lastT = 0, lastW = 0, lastH = 0;
-    const KROT = 1.4, KZOOM = 1.6, FLY_MOVE = 0.26, FLY_TURN = 1.3;   // FLY_MOVE slowed ~×0.75 for the bigger world
+    const KROT = 1.4, KZOOM = 1.6, FLY_MOVE = 3.46 / R, FLY_TURN = 1.3;   // FLY_MOVE ~3.46 units/s (linear/R) — scales with world size
     function advanceFly(dθ) {
       const c = Math.cos(dθ), s = Math.sin(dθ);
       tmpA.copy(anchor).multiplyScalar(c).addScaledVector(fwd, s);
