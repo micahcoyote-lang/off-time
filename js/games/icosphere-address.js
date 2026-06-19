@@ -86,6 +86,8 @@ ICO_FACES.forEach((corners, F) => {
   });
 });
 
+const FACE_CENTERS = ICO_FACES.map(([a, b, c]) => ICO[a].clone().add(ICO[b]).add(ICO[c]).normalize());
+
 // ---- region taxonomy ----
 export const REGION_PENT = 0, REGION_EDGE = 12, REGION_FACE = 42, REGION_COUNT = 62;
 export const regionType = (r) => (r < REGION_EDGE ? 'pent' : r < REGION_FACE ? 'edge' : 'face');
@@ -260,6 +262,37 @@ export function columnGeometry(addr, f) {
   for (let k = 0; k < m; k++) boundary.push(oC[k].clone().add(oC[(k + 1) % m]).add(center).normalize());   // dual vertex between consecutive neighbours
   for (let k = 0; k < m; k++) neighborAddrs.push(oA[(k + 1) % m]);   // neighbour across edge boundary[k]→boundary[k+1]
   return { center, boundary, neighborAddrs, isPentagon: m === 5 };
+}
+
+// ---- position → nearest column address (picking / physics in region mode; inverse of centerOf) ----
+// Robust to the slerp lattice's curvature: estimate the lattice cell from linear barycentric, then pick the
+// nearest actual grid centre in a small neighbourhood and canonicalise it. Round-trips centerOf exactly.
+const _bv0 = new THREE.Vector3(), _bv1 = new THREE.Vector3(), _bv2 = new THREE.Vector3();
+export function addressOf(p, f) {
+  let bestF = 0, bd = -2;
+  for (let F = 0; F < 20; F++) { const d = p.dot(FACE_CENTERS[F]); if (d > bd) { bd = d; bestF = F; } }
+  const [ia, ib, ic] = ICO_FACES[bestF], A = ICO[ia], B = ICO[ib], C = ICO[ic];
+  _bv0.subVectors(B, A); _bv1.subVectors(C, A); _bv2.subVectors(p, A);
+  const d00 = _bv0.dot(_bv0), d01 = _bv0.dot(_bv1), d11 = _bv1.dot(_bv1), d20 = _bv2.dot(_bv0), d21 = _bv2.dot(_bv1);
+  const denom = (d00 * d11 - d01 * d01) || 1;
+  const wB = (d11 * d20 - d01 * d21) / denom, wC = (d00 * d21 - d01 * d20) / denom;
+  // start from the linear-barycentric estimate, then hill-climb on the lattice to the nearest grid centre
+  // (the linear estimate can be several cells off near face edges because the slerp lattice curves).
+  let i = Math.max(0, Math.min(f, Math.round((wB + wC) * f))), j = Math.max(0, Math.min(i, Math.round(wC * f)));
+  let cur = faceLatticePos(bestF, i, j, f).distanceToSquared(p);
+  const MOVES = [[0, -1], [0, 1], [-1, -1], [-1, 0], [1, 0], [1, 1]];   // the 6 triangular-lattice neighbours
+  for (let iter = 0; iter < 4 * f + 16; iter++) {
+    let ni = i, nj = j, nd = cur;
+    for (const [di, dj] of MOVES) {
+      const ti = i + di, tj = j + dj;
+      if (ti < 0 || ti > f || tj < 0 || tj > ti) continue;
+      const dd = faceLatticePos(bestF, ti, tj, f).distanceToSquared(p);
+      if (dd < nd) { nd = dd; ni = ti; nj = tj; }
+    }
+    if (ni === i && nj === j) break;
+    i = ni; j = nj; cur = nd;
+  }
+  return classify(bestF, i, j, f);
 }
 
 // ---- enumerate every column of a region (for on-demand generation in C2) ----
