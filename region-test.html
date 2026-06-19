@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Earth — region engine test (Phase C)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1220; color: #cfe3ff; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 10px; left: 10px; z-index: 10; background: rgba(8,14,28,.82); border: 1px solid #2a3a55;
+         border-radius: 8px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; max-width: 320px; }
+  #hud h1 { font-size: 13px; margin: 0 0 6px; color: #9fd0ff; }
+  #hud label { display: inline-block; }
+  #hud input { width: 64px; background: #0e1830; color: #cfe3ff; border: 1px solid #2a3a55; border-radius: 4px; padding: 2px 4px; font: inherit; }
+  #hud button { margin-top: 6px; background: #1c3a6e; color: #dcebff; border: 1px solid #3a5a8e; border-radius: 5px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  #hud button:hover { background: #244a86; }
+  #stats { margin-top: 8px; color: #8fb6e6; white-space: pre-line; }
+  #hint { margin-top: 8px; color: #6f90c0; }
+  .warn { color: #ffc98a; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Phase C — region engine test</h1>
+  <label>freq <input id="freq" type="number" value="96" min="8" max="640" step="8"></label>
+  <label>seed <input id="seed" type="number" value="1337"></label>
+  <button id="go">Regenerate</button>
+  <div id="stats">building…</div>
+  <div id="hint">Click the view to capture the mouse, then <b>W A S D</b> to move, mouse to look, <b>Space/Shift</b> up/down, <b>Esc</b> to release. Scroll to change speed.</div>
+</div>
+<script type="module">
+import * as THREE from './assets/vendor/three.module.js';
+import { addressOf, decodeId, regionType, regionColumns } from './js/games/icosphere-address.js';
+import { RegionCache, RegionWorld, regionColumnObjects } from './js/games/planet-region.js';
+import { meshChunkArrays, makeSolidMaterial } from './js/games/planet-mesh.js';
+import { MAX_R, R, radius, SEA_L } from './data/planet.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fc4f0);                 // simple daytime sky
+scene.fog = new THREE.FogExp2(0xa8d1ff, 0.012);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, MAX_R * 8);
+
+const sunDir = new THREE.Vector3(0.4, 1, 0.5).normalize();
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.1); sun.position.copy(sunDir).multiplyScalar(MAX_R * 4); scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xcfe7ff, 0x33414f, 0.7));
+scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+
+const solidMat = makeSolidMaterial();
+const waterMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.62, depthWrite: false });
+let worldGroup = new THREE.Group(); scene.add(worldGroup);
+
+const statsEl = document.getElementById('stats');
+
+function build() {
+  const f = Math.max(8, Math.min(640, parseInt(document.getElementById('freq').value) || 96));
+  const seed = parseInt(document.getElementById('seed').value) | 0;
+  statsEl.textContent = 'building f=' + f + '…';
+  // defer so the label paints first
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const t0 = performance.now();
+    scene.remove(worldGroup); worldGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); }); worldGroup = new THREE.Group();
+    const cache = new RegionCache(f, seed, 99999);
+    const world = new RegionWorld(cache);
+    // a contiguous patch around (0,0,1): the start region + its bordering regions (shows seams)
+    const start = addressOf(new THREE.Vector3(0, 0, 1), f);
+    const regionSet = new Set([start.region]);
+    for (const col of regionColumnObjects(start.region, f)) for (const nb of col.neighbors) regionSet.add(decodeId(nb, f).region);
+    let solidTris = 0, waterTris = 0, cols = 0;
+    const counts = { pent: 0, edge: 0, face: 0 };
+    for (const region of regionSet) {
+      counts[regionType(region)]++;
+      const colObjs = regionColumnObjects(region, f); cols += colObjs.length;
+      const m = meshChunkArrays(colObjs, world);
+      if (m.sPos.length) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(m.sPos, 3));
+        g.setAttribute('color', new THREE.BufferAttribute(m.sCol, 3));
+        g.setAttribute('tile', new THREE.BufferAttribute(m.sTile, 1));
+        g.computeVertexNormals(); g.computeBoundingSphere();
+        worldGroup.add(new THREE.Mesh(g, solidMat)); solidTris += m.sPos.length / 9;
+      }
+      if (m.wPos.length) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(m.wPos, 3));
+        g.setAttribute('color', new THREE.BufferAttribute(m.wCol, 3));
+        g.computeBoundingSphere();
+        const wm = new THREE.Mesh(g, waterMat); wm.renderOrder = 1; worldGroup.add(wm); waterTris += m.wPos.length / 9;
+      }
+    }
+    scene.add(worldGroup);
+    // place the camera above the start point looking at the surface
+    const startDir = new THREE.Vector3(0, 0, 1);
+    const surfR = radius(SEA_L + 20);
+    camera.position.copy(startDir).multiplyScalar(surfR + 6).add(new THREE.Vector3(2, 0, 0));
+    camera.lookAt(startDir.clone().multiplyScalar(R));
+    euler.setFromQuaternion(camera.quaternion, 'YXZ');
+    const ms = (performance.now() - t0) | 0;
+    statsEl.textContent = `f=${f}  seed=${seed}\nregions ${regionSet.size} (${counts.face}face ${counts.edge}edge ${counts.pent}pent)\ncolumns ${cols.toLocaleString()}\nsolid ${solidTris.toLocaleString()} tris · water ${waterTris.toLocaleString()} tris\nbuilt in ${ms} ms` + (f > 256 ? '\n⚠ high freq — whole-region gen is heavy (chunking comes with the earth.js cutover)' : '');
+  }));
+}
+document.getElementById('go').addEventListener('click', build);
+
+// ---- minimal free-fly camera (pointer lock) ----
+const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+const keys = new Set();
+let speed = R * 0.02;
+renderer.domElement.addEventListener('click', () => renderer.domElement.requestPointerLock());
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  euler.y -= e.movementX * 0.0022; euler.x -= e.movementY * 0.0022;
+  euler.x = Math.max(-1.5, Math.min(1.5, euler.x));
+  camera.quaternion.setFromEuler(euler);
+});
+addEventListener('keydown', (e) => keys.add(e.code));
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('wheel', (e) => { speed *= e.deltaY < 0 ? 1.15 : 0.87; speed = Math.max(R * 0.002, Math.min(R * 0.5, speed)); });
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), upW = new THREE.Vector3();
+let last = performance.now();
+function frame() {
+  const now = performance.now(), dt = Math.min(0.05, (now - last) / 1000); last = now;
+  camera.getWorldDirection(fwd); right.crossVectors(fwd, camera.up).normalize(); upW.copy(camera.position).normalize();
+  const v = speed * dt * 60;
+  if (keys.has('KeyW')) camera.position.addScaledVector(fwd, v);
+  if (keys.has('KeyS')) camera.position.addScaledVector(fwd, -v);
+  if (keys.has('KeyD')) camera.position.addScaledVector(right, v);
+  if (keys.has('KeyA')) camera.position.addScaledVector(right, -v);
+  if (keys.has('Space')) camera.position.addScaledVector(upW, v);
+  if (keys.has('ShiftLeft')) camera.position.addScaledVector(upW, -v);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+build();
+frame();
+</script>
+</body>
+</html>

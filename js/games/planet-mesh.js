@@ -487,20 +487,11 @@ export function meshSurfaceSkin(columns, cells) {
 const _EMPTY = new Float32Array(0);
 const EMPTY_ARRAYS = { sPos: _EMPTY, sCol: _EMPTY, wPos: _EMPTY, wCol: _EMPTY };   // for unloading a chunk
 
-/* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY
-   up front (add them to the scene immediately) and filled INCREMENTALLY by buildNext() so a 100k-tile
-   planet doesn't freeze the tab — the caller drives buildNext() across frames behind a progress
-   overlay. Returns a manager that also rebuilds individual chunks cheaply when an edit changes only a
-   few columns. (Some chunk buckets fall outside their icosa face and stay empty — handled.) */
-export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
-  const groups = Array.from({ length: chunkCount }, () => []);
-  for (const col of columns) groups[col.chunk].push(col);
-  // Lambert (cheap, diffuse-only) instead of Standard PBR — the non-indexed geometry already
-  // has per-face-constant normals, so it still reads as crisp flat-shaded facets but costs far
-  // less per fragment (big win full-screen on integrated GPUs).
-  // Solid terrain: MeshLambert (keeps the built-in sun lighting + shadow receiving) with the vertex colour
-  // as pure AO/shade grey, PATCHED via onBeforeCompile to multiply in a TRIPLANAR sample of the full-COLOUR
-  // texture atlas (per-vertex `tile`). Triplanar (world-space projection) textures hexagonal faces without UVs.
+// The solid-terrain material: Lambert (cheap, diffuse-only; per-face-constant normals already read as crisp
+// flat-shaded facets) with the vertex colour as pure AO/shade grey, PATCHED via onBeforeCompile to multiply
+// in a TRIPLANAR sample of the full-COLOUR texture atlas (per-vertex `tile`). Triplanar (world-space) textures
+// hexagonal faces without UVs. Exported so the region test-harness renders terrain identically to the game.
+export function makeSolidMaterial() {
   const atlas = buildTextureAtlas();
   const solidMat = new THREE.MeshLambertMaterial({ vertexColors: true });
   solidMat.onBeforeCompile = (shader) => {
@@ -523,6 +514,16 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
                 + texture2D(uAtlas, (org + iz) / uGrid).rgb * bw.z;
          diffuseColor.rgb *= d; }`);
   };
+  return solidMat;
+}
+
+/* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY up front
+   (added to the scene immediately) and filled INCREMENTALLY by buildNext() so a big planet doesn't freeze the
+   tab. Returns a manager that also rebuilds individual chunks cheaply on edits. */
+export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
+  const groups = Array.from({ length: chunkCount }, () => []);
+  for (const col of columns) groups[col.chunk].push(col);
+  const solidMat = makeSolidMaterial();
 
   // Water is a second, translucent pass with its OWN shader: per-vertex depth tint (vColor) +
   // a gentle radial wave bob + fresnel sheen + a sun-specular glint that tracks the day/night sun.
