@@ -13,7 +13,7 @@
 import * as THREE from '../../assets/vendor/three.module.js';
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
   WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE,
-  SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, ROT_SHIFT, TH } from '../../data/planet.js';
+  SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, SHAPE_STAIRS, ROT_SHIFT, TH } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -329,6 +329,17 @@ function emitBar(a, b, up, halfW, halfUp, col, positions, colors) {
   const q = (i, j, k, l) => { pushTriC(c[i], c[j], c[k], col, col, col, _mCtr, positions, colors); pushTriC(c[i], c[k], c[l], col, col, col, _mCtr, positions, colors); };
   q(0, 1, 2, 3); q(4, 5, 6, 7); q(0, 1, 5, 4); q(1, 2, 6, 5); q(2, 3, 7, 6); q(3, 0, 4, 7);
 }
+// a full hexagonal band [rLo,rHi] at the column: top cap (at rHi) + all side walls. No culling — used for
+// discrete mesh blocks (e.g. a stair's bottom slab). `B` are the cell's unit boundary verts about centre C.
+function emitHexBand(C, B, n, rLo, rHi, colTop, colSide, positions, colors) {
+  const ctrTop = C.clone().multiplyScalar(rHi), ref = C.clone().multiplyScalar((rLo + rHi) / 2);
+  for (let k = 0; k < n; k++) { const k2 = (k + 1) % n;
+    pushTriC(ctrTop, B[k].clone().multiplyScalar(rHi), B[k2].clone().multiplyScalar(rHi), colTop, colTop, colTop, ref, positions, colors);
+    const aHi = B[k].clone().multiplyScalar(rHi), bHi = B[k2].clone().multiplyScalar(rHi), aLo = B[k].clone().multiplyScalar(rLo), bLo = B[k2].clone().multiplyScalar(rLo);
+    pushTriC(aHi, bHi, bLo, colSide, colSide, colSide, ref, positions, colors);
+    pushTriC(aHi, bLo, aLo, colSide, colSide, colSide, ref, positions, colors);
+  }
+}
 // a tapered hexagonal post at the column centre: footprint = the cell hexagon shrunk toward C (scale sLo
 // at the base, sHi at the top → a slight cap flare), spanning radii [rLo,rHi]. Top cap + side walls.
 function emitPost(C, B, n, rLo, rHi, sLo, sHi, colTop, colSide, positions, colors) {
@@ -378,6 +389,29 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
       _fUp.copy(bnd[o]).add(bnd[(o + 1) % n]).normalize(); _fB.copy(_fUp).multiplyScalar(rMid);               // other end (opposite edge)
       _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]);
       emitBar(_fA, _fB, col.center, 0.018, (rOut - rIn) / 2, _sideC, positions, colors);
+      continue;
+    }
+
+    // STAIRS (oriented mesh block): a full bottom slab + the 3 back sectors raised to a top step + riser.
+    if (shape === SHAPE_STAIRS) {
+      const rot = (st >> ROT_SHIFT) & 7, rIn = radius(L), rOut = radius(L + 1), rMid = (rIn + rOut) / 2, C = col.center;
+      _top.copy(COLORS[matn]); _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
+      emitHexBand(C, bnd, n, rIn, rMid, _top, _sideC, positions, colors);                  // bottom slab (full)
+      const refUp = C.clone().multiplyScalar((rMid + rOut) / 2);
+      _fUp.copy(bnd[rot % n]).add(bnd[(rot + 1) % n]).normalize();                          // facing direction
+      _capRef.copy(C).addScaledVector(_fUp, 0.5).multiplyScalar((rMid + rOut) / 2);          // a point inside the raised half (riser ref)
+      for (const k of [(rot + n - 1) % n, rot % n, (rot + 1) % n]) {                        // the 3 back sectors → top step
+        const k2 = (k + 1) % n;
+        pushTriC(C.clone().multiplyScalar(rOut), bnd[k].clone().multiplyScalar(rOut), bnd[k2].clone().multiplyScalar(rOut), _top, _top, _top, refUp, positions, colors);   // top cap
+        const aHi = bnd[k].clone().multiplyScalar(rOut), bHi = bnd[k2].clone().multiplyScalar(rOut), aLo = bnd[k].clone().multiplyScalar(rMid), bLo = bnd[k2].clone().multiplyScalar(rMid);
+        pushTriC(aHi, bHi, bLo, _sideC, _sideC, _sideC, refUp, positions, colors);          // outer side wall
+        pushTriC(aHi, bLo, aLo, _sideC, _sideC, _sideC, refUp, positions, colors);
+      }
+      for (const seam of [(rot + n - 1) % n, (rot + 2) % n]) {                              // 2 radial riser faces (front of the step)
+        const oHi = bnd[seam].clone().multiplyScalar(rOut), cHi = C.clone().multiplyScalar(rOut), oLo = bnd[seam].clone().multiplyScalar(rMid), cLo = C.clone().multiplyScalar(rMid);
+        pushTriC(cHi, oHi, oLo, _sideC, _sideC, _sideC, _capRef, positions, colors);
+        pushTriC(cHi, oLo, cLo, _sideC, _sideC, _sideC, _capRef, positions, colors);
+      }
       continue;
     }
 

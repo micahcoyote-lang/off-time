@@ -23,7 +23,7 @@ import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfa
 import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS,
-  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE,
+  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, SHAPE_STAIRS,
   ROT_MASK, packState, ORIENTED } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
@@ -632,18 +632,20 @@ export function mountEarth(task) {
     function doPlace() {
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
       if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
-      const rot = ORIENTED.has(heldShape) ? paneRot(target.placeColId) : 0;   // oriented shapes face the player
+      const rot = ORIENTED.has(heldShape) ? placeRot(target.placeColId, heldShape === SHAPE_PANE) : 0;
       applyEdit(target.placeColId, target.placeL, matNum(), packState(heldShape, rot));
     }
-    // pick the hex-edge diameter a pane/wall should span so it faces the player (⟂ to the view direction)
+    // pick the hex edge a placed oriented block aligns to, from the player's view in the cell's tangent plane.
+    // perp=true (panes): the wall spans the diameter ⟂ view, so it faces you. perp=false (stairs): the high
+    // step rises along the view direction (away from you).
     const _pr1 = new THREE.Vector3(), _pr2 = new THREE.Vector3(), _pr3 = new THREE.Vector3();
-    function paneRot(colId) {
+    function placeRot(colId, perp) {
       const col = columns[colId], C = col.center, b = col.boundary, nb = b.length;
       _pr1.copy(fwd).addScaledVector(C, -fwd.dot(C));                          // view direction in the cell's tangent plane
       if (_pr1.lengthSq() < 1e-6) return 0;
-      _pr2.crossVectors(C, _pr1).normalize();                                  // diameter ⟂ view → the wall faces you
+      if (perp) _pr2.crossVectors(C, _pr1).normalize(); else _pr2.copy(_pr1).normalize();
       let best = 0, bd = -2;
-      for (let k = 0; k < nb; k++) { _pr3.copy(b[k]).add(b[(k + 1) % nb]).normalize(); const d = Math.abs(_pr3.dot(_pr2)); if (d > bd) { bd = d; best = k; } }
+      for (let k = 0; k < nb; k++) { _pr3.copy(b[k]).add(b[(k + 1) % nb]).normalize(); const d = perp ? Math.abs(_pr3.dot(_pr2)) : _pr3.dot(_pr2); if (d > bd) { bd = d; best = k; } }
       return best;
     }
     function doMine() {
@@ -678,6 +680,9 @@ export function mountEarth(task) {
           heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.035, 0.05, 0.24, 6), MATERIALS[matIdx].color, 0, 0, 0));   // a fence post
         } else if (heldShape === SHAPE_PANE) {
           heldGroup.add(vmBox(0.19, 0.19, 0.022, MATERIALS[matIdx].color, 0, 0, 0));   // a thin pane
+        } else if (heldShape === SHAPE_STAIRS) {
+          heldGroup.add(vmBox(0.18, 0.07, 0.18, MATERIALS[matIdx].color, 0, -0.04, 0));      // bottom slab
+          heldGroup.add(vmBox(0.18, 0.07, 0.09, MATERIALS[matIdx].color, 0, 0.03, -0.045));  // raised back step
         } else {
           const full = heldShape === SHAPE_FULL, h = full ? 0.13 : 0.065;     // slabs are half-height
           const yOff = full ? 0 : (heldShape === SHAPE_SLAB_HI ? 0.0325 : -0.0325);
