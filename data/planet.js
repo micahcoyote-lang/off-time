@@ -32,9 +32,9 @@ export const WATER_WAVE = 0.05;        // radial wave amplitude on the surface (
 export const WADE_MAX = 0.45;          // water depth (world units) you can stand in before you must swim (~2-layer shelf)
 
 // ---- E3: LOD globe + surface chunk streaming ----
-export const FREQ_COARSE = 30;         // coarse LOD globe frequency (~9k cols → constant orbit cost, any world size)
-export const STREAM_MARGIN = 0.2;      // radians of fine-chunk patch kept beyond the horizon around the camera
-export const MAX_ACTIVE_CHUNKS = 48;   // cap on simultaneously-meshed fine chunks (memory/perf guard)
+export const FREQ_COARSE = 64;         // coarse LOD globe frequency (denser → distant silhouette/biomes match the fine terrain, softer horizon)
+export const STREAM_MARGIN = 0.35;     // radians of fine-chunk patch kept beyond the horizon around the camera (larger → fine terrain reaches further before coarse takes over)
+export const MAX_ACTIVE_CHUNKS = 72;   // cap on simultaneously-meshed fine chunks (memory/perf guard)
 export const BODY_SUBMERGE = 0.35;     // how far the floating eye sits below the water surface when swimming
 export const SWIM_FACTOR = 0.6;        // movement-speed multiplier while in water
 

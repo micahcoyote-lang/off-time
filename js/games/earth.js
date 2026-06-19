@@ -93,8 +93,8 @@ export function mountEarth(task) {
     scene.background = new THREE.Color(0x0b1220);          // deep space slate
     const camera = new THREE.PerspectiveCamera(55, 16 / 9, 0.1, MAX_R * 8);
 
-    scene.add(new THREE.HemisphereLight(0xcfe7ff, 0x202b3a, 0.8));
-    scene.add(new THREE.AmbientLight(0xffffff, 0.22));
+    const hemi = new THREE.HemisphereLight(0xcfe7ff, 0x202b3a, 0.8); scene.add(hemi);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.22); scene.add(ambient);
     const sun = new THREE.DirectionalLight(0xfff4e0, 1.0);
     sun.position.set(MAX_R * 3, MAX_R * 2, MAX_R * 1.5);
     sun.castShadow = true;
@@ -105,6 +105,10 @@ export function mountEarth(task) {
       c.left = -MAX_R * 1.3; c.right = MAX_R * 1.3; c.top = MAX_R * 1.3; c.bottom = -MAX_R * 1.3;
       c.near = MAX_R * 2; c.far = MAX_R * 6; c.updateProjectionMatrix(); }
     scene.add(sun); scene.add(sun.target);
+    // atmospheric haze: fogs the SOLID terrain (coarse + fine Lambert) near the horizon so the LOD seam
+    // dissolves into distance + adds aerial perspective. Density is toggled off in orbit (see frame()).
+    scene.fog = new THREE.FogExp2(0xa8d1ff, 0.0);
+    const FOG_DENSITY = 0.05;
 
     // ---- dynamic sun: day/night rotation ----
     const sunDir = new THREE.Vector3(1, 0, 0);
@@ -115,6 +119,16 @@ export function mountEarth(task) {
       dayT += dt * timeScale;
       sunDir.copy(sunBase).applyAxisAngle(sunAxis, (dayT / DAY_SECONDS) * Math.PI * 2);
       sun.position.copy(sunDir).multiplyScalar(MAX_R * 4);
+      // tint the WORLD lighting to the player's local time-of-day (the sky dome handles itself):
+      // warm low sun (golden hour) → neutral noon; cool, dim ambient at night so the dark side reads moody.
+      const el = sunDir.dot(anchor);                                  // local sun elevation (-1 night .. 1 noon)
+      const d = Math.max(0, Math.min(1, (el + 0.25) / 0.4));          // 0 deep night .. 1 day (twilight band)
+      const warm = Math.max(0, Math.min(1, el / 0.35));               // 0 low sun (warm) .. 1 high (neutral)
+      sun.color.setRGB(1.0, 0.62 + 0.33 * warm, 0.38 + 0.50 * warm);
+      hemi.intensity = 0.22 + 0.58 * d;
+      ambient.intensity = 0.05 + 0.18 * d;
+      ambient.color.setRGB(0.5 + 0.5 * d, 0.56 + 0.44 * d, 0.74 + 0.26 * d);
+      scene.fog.color.setRGB(0.04 + 0.62 * d, 0.06 + 0.76 * d, 0.12 + 0.88 * d);   // haze matches the sky: dark night → pale day
     }
 
     // ---- atmosphere: rim glow (from space) + sky dome (from the ground) ----
@@ -133,12 +147,16 @@ export function mountEarth(task) {
         void main(){
           vec3 n = normalize(vPosW);
           vec3 v = normalize(uCamPos - vPosW);
+          vec3 sd = normalize(uSunDir);
           // peak at the limb (v ⟂ n), fade to 0 toward BOTH the planet centre and deep space —
           // abs() prevents the whole far hemisphere from glowing and flooding the background.
           float rim = pow(1.0 - abs(dot(v, n)), uPower);
-          float lit = clamp(dot(n, normalize(uSunDir)) * 0.5 + 0.5, 0.0, 1.0);
-          float glow = rim * uIntensity * (0.2 + 0.8 * lit);
-          gl_FragColor = vec4(uAtmColor * glow, glow);
+          float lit = clamp(dot(n, sd) * 0.5 + 0.5, 0.0, 1.0);
+          // forward scatter: looking toward the sun through the limb → a brighter, warmer crescent
+          float fwd = pow(clamp(dot(v, -sd), 0.0, 1.0), 4.0);
+          vec3 col = mix(uAtmColor, vec3(1.0, 0.82, 0.6), fwd * 0.55);
+          float glow = rim * uIntensity * (0.15 + 0.85 * lit) * (1.0 + fwd * 1.6);
+          gl_FragColor = vec4(col * glow, glow);
         }`,
       side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     });
@@ -153,14 +171,23 @@ export function mountEarth(task) {
         void main(){
           vec3 up = normalize(uCamPos);
           vec3 dir = normalize(vPosW - uCamPos);
-          float h = clamp(dot(dir, up) * 0.5 + 0.5, 0.0, 1.0);          // 0 below .. 1 zenith
-          float sunEl = dot(up, normalize(uSunDir));                    // sun elevation at camera
-          float day = clamp(sunEl * 1.4 + 0.25, 0.0, 1.0);
+          vec3 sd = normalize(uSunDir);
+          float h = clamp(dot(dir, up) * 0.5 + 0.5, 0.0, 1.0);          // 0 horizon .. 1 zenith
+          float sunEl = dot(up, sd);                                    // sun elevation at the camera
+          float sunDot = max(dot(dir, sd), 0.0);                        // 1 = looking straight at the sun
+          // 3-stop vertical gradient: pale hazy horizon -> atmosphere blue -> deeper zenith
+          vec3 sky = mix(mix(uAtmColor, vec3(0.86, 0.92, 1.0), 0.55), uAtmColor * 0.45, pow(h, 0.55));
+          // sun glow + disc (only above the horizon)
+          float aboveH = smoothstep(-0.08, 0.06, sunEl);
+          sky += vec3(1.0, 0.93, 0.78) * (pow(sunDot, 6.0) * 0.35 + pow(sunDot, 48.0) * 0.7) * aboveH;   // halo
+          sky += vec3(1.0, 0.96, 0.88) * smoothstep(0.9975, 0.9990, sunDot) * 2.5 * aboveH;              // disc
+          // sunset: warm band hugging the horizon when the sun is low, strongest toward its azimuth
+          float sunsetAmt = clamp(1.0 - abs(sunEl) * 2.2, 0.0, 1.0) * (1.0 - h) * (0.35 + 0.65 * pow(sunDot, 2.0));
+          sky = mix(sky, vec3(1.0, 0.48, 0.24), clamp(sunsetAmt, 0.0, 1.0) * 0.7);
+          // day -> night: fade to a dim night blue, not pure black
+          vec3 col = mix(vec3(0.015, 0.025, 0.05), sky, clamp(sunEl * 1.5 + 0.32, 0.0, 1.0));
           float altFade = 1.0 - smoothstep(${(R * 1.4).toFixed(2)}, ${(R * 2.4).toFixed(2)}, length(uCamPos));
-          vec3 sky = mix(uAtmColor * 1.25, uAtmColor * 0.55, h);        // horizon brighter than zenith
-          float sunset = clamp(1.0 - abs(sunEl) * 3.0, 0.0, 1.0) * (1.0 - h);
-          sky = mix(sky, vec3(1.0, 0.55, 0.3), sunset * 0.6);           // warm band near the terminator
-          gl_FragColor = vec4(sky * day, altFade * uSky);
+          gl_FragColor = vec4(col, altFade * uSky);
         }`,
       side: THREE.BackSide, transparent: true, depthWrite: false,
     });
@@ -1084,6 +1111,7 @@ export function mountEarth(task) {
       updateSun(dt);                                       // day/night rotation
       atmU.uCamPos.value.copy(camera.position);            // atmosphere/sky need the eye position
       atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
+      scene.fog.density = camMode === 'orbit' ? 0 : FOG_DENSITY;   // no haze from space (would hide the planet)
       planet.waterUniforms.uTime.value += dt;              // animate the water surface (uSunDir is shared/live)
       shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
