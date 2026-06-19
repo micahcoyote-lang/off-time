@@ -54,7 +54,8 @@ const solidMat = makeSolidMaterial();
 const waterMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.62, depthWrite: false });
 
 const statsEl = document.getElementById('stats');
-const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+const yawDir = new THREE.Vector3(1, 0, 0);   // forward tangent (world); kept perpendicular to the radial up
+let pitch = -0.2;                            // look angle above/below the horizon
 let streamer = null;
 
 function start() {
@@ -68,9 +69,7 @@ function start() {
   const startDir = new THREE.Vector3(0, 0, 1);
   const surfR = surfaceRadiusAt(startDir, f, seed);
   camera.position.copy(startDir).multiplyScalar(surfR + 1.5);
-  const look = new THREE.Vector3(1, 0, 0).multiplyScalar(surfR).add(startDir.clone().multiplyScalar(surfR * 0.92));
-  camera.lookAt(look);
-  euler.setFromQuaternion(camera.quaternion, 'YXZ');
+  yawDir.set(1, 0, 0); pitch = -0.2;          // look "east" along the surface, slightly down
 }
 // surface radius under a direction: generate just the column there and read its top layer
 function surfaceRadiusAt(dir, f, seed) {
@@ -83,12 +82,14 @@ document.getElementById('go').addEventListener('click', start);
 // ---- free-fly camera ----
 const keys = new Set();
 let speed = R * 0.02;
+const _mUp = new THREE.Vector3();
 renderer.domElement.addEventListener('click', () => renderer.domElement.requestPointerLock());
 document.addEventListener('mousemove', (e) => {
   if (document.pointerLockElement !== renderer.domElement) return;
-  euler.y -= e.movementX * 0.0022; euler.x -= e.movementY * 0.0022;
-  euler.x = Math.max(-1.5, Math.min(1.5, euler.x));
-  camera.quaternion.setFromEuler(euler);
+  _mUp.copy(camera.position).normalize();                       // radial "up"
+  yawDir.applyAxisAngle(_mUp, -e.movementX * 0.0022);           // yaw around up
+  yawDir.addScaledVector(_mUp, -yawDir.dot(_mUp)).normalize();  // keep forward tangent
+  pitch = Math.max(-1.45, Math.min(1.45, pitch - e.movementY * 0.0022));
 });
 addEventListener('keydown', (e) => keys.add(e.code));
 addEventListener('keyup', (e) => keys.delete(e.code));
@@ -99,7 +100,11 @@ const fwd = new THREE.Vector3(), right = new THREE.Vector3(), upW = new THREE.Ve
 let last = performance.now(), fps = 60, acc = 0, frames = 0;
 function frame() {
   const now = performance.now(), dt = Math.min(0.05, (now - last) / 1000); last = now;
-  camera.getWorldDirection(fwd); right.crossVectors(fwd, camera.up).normalize(); upW.copy(camera.position).normalize();
+  // sphere-aware basis: up = radial, forward = tangent yawDir tilted by pitch, right = forward × up
+  upW.copy(camera.position).normalize();
+  yawDir.addScaledVector(upW, -yawDir.dot(upW)).normalize();    // re-tangent as we move around the globe
+  right.crossVectors(yawDir, upW).normalize();
+  fwd.copy(yawDir).applyAxisAngle(right, pitch);
   const v = speed * dt * 60;
   if (keys.has('KeyW')) camera.position.addScaledVector(fwd, v);
   if (keys.has('KeyS')) camera.position.addScaledVector(fwd, -v);
@@ -107,6 +112,7 @@ function frame() {
   if (keys.has('KeyA')) camera.position.addScaledVector(right, -v);
   if (keys.has('Space')) camera.position.addScaledVector(upW, v);
   if (keys.has('ShiftLeft')) camera.position.addScaledVector(upW, -v);
+  camera.up.copy(upW); camera.lookAt(camera.position.clone().add(fwd));
 
   let info = null;
   if (streamer) { anchor.copy(camera.position).normalize(); info = streamer.update(anchor, 6); }
