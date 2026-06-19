@@ -51,9 +51,13 @@ export function mountEarth(task) {
   legend.innerHTML =
     '<b>Controls</b><br>G — mode: Orbit / Fly / Walk<br>W A S D — move<br>' +
     'Q / E — zoom / altitude<br>Walk: mouse — look · Space — jump<br>' +
-    'F — place · R — mine<br>C / V — material<br>1 / 2 — Place / Mine<br>H — hide this';
+    'F — place · R — mine<br>C / V — material<br>1 / 2 — Place / Mine<br>M — world map<br>H — hide this';
   const overlay = el('div.earth-loading', { text: 'Generating planet…' });
-  stage.append(view, hud, reticle, belt, legend, overlay);
+  const mapEl = el('div.earth-map.hidden', {
+    html: '<div class="earth-map-frame"><div class="earth-map-title">World Map · drag to spin · M / Esc to close</div></div>',
+  });
+  const mapFrame = mapEl.querySelector('.earth-map-frame');
+  stage.append(view, hud, reticle, belt, legend, overlay, mapEl);
   screen.append(stage);
 
   // Deferred build: paint the overlay first, then do the heavy generation one tick later.
@@ -168,6 +172,14 @@ export function mountEarth(task) {
     let peakCol = 0, peakL = 0, peakAbove = 0;
     const activeSet = new Set();                          // fine chunk ids currently meshed (E3 streaming)
 
+    // ---- world map (P1a): a rotatable biome mini-globe + discovery fog ----
+    let mapMesh = null, mapBaseCol = null, mapCol = null, mapChunkVtx = null, mapDirty = false;  // merged coarse globe
+    let mapScene = null, mapCam = null, mapMarkPlayer = null, mapMarkPeak = null;
+    let mapOpen = false, mapTheta = 0.6, mapPhi = 1.05, fogInited = false;
+    const discovered = new Set();                         // chunk ids the player has visited
+    let discoNew = 0;                                     // new regions since last persist (save throttle)
+    const FOG_COLOR = new THREE.Color(0x223047), FOG_MIX = 0.86, MAP_PANEL_FRAC = 0.62, DISCO_SAVE_EVERY = 8;
+
     // bucketed nearest-column query: ~180 chunk-centroid dots → scan that chunk + its neighbours
     // (~1-2k cols) instead of all N. Returns -1 before the world has loaded (chunkCount 0).
     function nearestColumn(hx, hy, hz) {
@@ -191,8 +203,9 @@ export function mountEarth(task) {
     if (compatible && Array.isArray(saved.edits)) {
       for (const ed of saved.edits) if (ed && ed.c >= 0) edits.set(ed.c, ed.m);
     }
+    if (compatible && Array.isArray(saved.discovered)) for (const ci of saved.discovered) discovered.add(ci);
     function persist() {
-      state.set('builds.earth', { v: 2, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })) });
+      state.set('builds.earth', { v: 2, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered] });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
@@ -224,6 +237,12 @@ export function mountEarth(task) {
         for (const nb of columns[i].neighbors) if (nb >= 0) { const cj = columns[nb].chunk; if (cj !== ci) scanSets[ci].add(cj); }
       }
       chunkScanArr = scanSets.map((s) => [...s]);
+
+      // map: discover the starting region (under the initial anchor (0,0,1)) + its ring; saved regions
+      // were already unioned into `discovered` at load. maybeInitFog() paints once the coarse mesh exists.
+      const startCi = columns[nearestColumn(0, 0, 1)]?.chunk;
+      if (startCi >= 0) { discovered.add(startCi); for (const nb of chunkScanArr[startCi]) discovered.add(nb); }
+      maybeInitFog();
 
       // fine chunk meshes (created empty; meshed on demand near the camera by updateStreaming)
       planet = buildPlanetChunks(columns, store, chunkCount, sunDir);
@@ -274,6 +293,96 @@ export function mountEarth(task) {
         m.visible = !activeSet.has(i);                   // hidden if this region is already fine
         coarseMeshes[i] = m; scene.add(m);
       }
+      // build the merged single-mesh globe for the world map (separate from the live coarse meshes,
+      // which keep their per-chunk .visible for streaming). Record each chunk's vertex range for fog.
+      let total = 0; for (let i = 0; i < d.chunkCount; i++) total += d.pos[i].length;
+      const mPos = new Float32Array(total), mCol = new Float32Array(total);
+      mapChunkVtx = new Int32Array(d.chunkCount * 2);
+      for (let i = 0, off = 0; i < d.chunkCount; i++) {
+        const p = d.pos[i], c = d.col[i];
+        mapChunkVtx[i * 2] = off / 3; mapChunkVtx[i * 2 + 1] = p.length / 3;
+        mPos.set(p, off); mCol.set(c, off); off += p.length;
+      }
+      mapBaseCol = mCol.slice();                          // pristine biome colors (never mutated)
+      mapCol = mCol;                                      // live attribute (greyed where undiscovered)
+      const mg = new THREE.BufferGeometry();
+      mg.setAttribute('position', new THREE.BufferAttribute(mPos, 3));
+      mg.setAttribute('color', new THREE.BufferAttribute(mapCol, 3));
+      if (total) { mg.computeVertexNormals(); mg.computeBoundingSphere(); }
+      mapMesh = new THREE.Mesh(mg, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+      mapMesh.frustumCulled = false;                     // lives in mapScene, not the live scene
+      maybeInitFog();
+    }
+
+    // ---- world map helpers (P1a) ----
+    // recolor one chunk's vertex slice: biome color if discovered, else lerped toward fog grey
+    function tintChunk(ci) {
+      if (!mapChunkVtx) return;
+      const start = mapChunkVtx[ci * 2] * 3, cnt = mapChunkVtx[ci * 2 + 1] * 3, seen = discovered.has(ci);
+      for (let o = start; o < start + cnt; o += 3) {
+        if (seen) { mapCol[o] = mapBaseCol[o]; mapCol[o + 1] = mapBaseCol[o + 1]; mapCol[o + 2] = mapBaseCol[o + 2]; }
+        else {
+          mapCol[o] = mapBaseCol[o] * (1 - FOG_MIX) + FOG_COLOR.r * FOG_MIX;
+          mapCol[o + 1] = mapBaseCol[o + 1] * (1 - FOG_MIX) + FOG_COLOR.g * FOG_MIX;
+          mapCol[o + 2] = mapBaseCol[o + 2] * (1 - FOG_MIX) + FOG_COLOR.b * FOG_MIX;
+        }
+      }
+      mapDirty = true;
+    }
+    function reveal(ci) { if (ci == null || ci < 0 || discovered.has(ci)) return; discovered.add(ci); discoNew++; tintChunk(ci); drawHud(); }
+    // one-time fog paint once BOTH the merged mesh and the chunk index exist (worker streams them apart)
+    function maybeInitFog() {
+      if (fogInited || !mapBaseCol || !chunkCount) return;
+      fogInited = true;
+      for (let ci = 0; ci < chunkCount; ci++) tintChunk(ci);   // discovered set already seeded (save + start region)
+      drawHud();
+    }
+    function discoveryPct() {
+      if (!chunkCount) return 0;
+      let total = 0; for (let i = 0; i < chunkCount; i++) if (!chEmpty[i]) total++;
+      let seen = 0; for (const ci of discovered) if (ci >= 0 && !chEmpty[ci]) seen++;
+      return total ? Math.round(seen / total * 100) : 0;
+    }
+    function ensureMapScene() {
+      if (mapScene || !mapMesh) return;
+      mapScene = new THREE.Scene();
+      mapScene.add(new THREE.HemisphereLight(0xcfe7ff, 0x202b3a, 1.0));
+      const dl = new THREE.DirectionalLight(0xffffff, 0.7); dl.position.set(2, 3, 2); mapScene.add(dl);
+      mapScene.add(mapMesh);
+      mapCam = new THREE.PerspectiveCamera(40, 1, R * 0.05, R * 8);
+      const mk = (h) => { const m = new THREE.Mesh(new THREE.ConeGeometry(R * 0.03, R * 0.13, 8), new THREE.MeshBasicMaterial({ color: h })); m.frustumCulled = false; return m; };
+      mapMarkPlayer = mk(0x4ade80); mapMarkPeak = mk(0xffd34d); mapScene.add(mapMarkPlayer, mapMarkPeak);
+    }
+    const _msph = new THREE.Spherical(), _mup = new THREE.Vector3(0, 1, 0);
+    function placeMapCamera() {
+      _msph.set(R * 2.6, Math.max(0.12, Math.min(Math.PI - 0.12, mapPhi)), mapTheta);
+      mapCam.position.setFromSpherical(_msph); mapCam.up.copy(_mup); mapCam.lookAt(0, 0, 0);
+    }
+    function placeRadialMarker(mesh, dir, seen) {
+      mesh.visible = seen; if (!seen || !dir) return;
+      mesh.position.copy(dir).multiplyScalar(surfaceRadiusAt(dir) + R * 0.06);
+      mesh.quaternion.setFromUnitVectors(_mup, dir);
+    }
+    const _mpd = new THREE.Vector3();
+    function updateMapMarkers() {
+      if (!columns) return;
+      const pdir = camMode === 'orbit' ? _mpd.copy(camera.position).normalize() : anchor;
+      placeRadialMarker(mapMarkPlayer, pdir, true);
+      const peakCi = columns[peakCol].chunk;
+      placeRadialMarker(mapMarkPeak, columns[peakCol].center, peakCi >= 0 && discovered.has(peakCi));
+    }
+    function toggleMap(force) {
+      const next = force == null ? !mapOpen : force;
+      if (next === mapOpen) return;
+      mapOpen = next;
+      if (mapOpen) {
+        ensureMapScene(); keys.clear();                  // freeze movement (drop held keys)
+        if (document.pointerLockElement) document.exitPointerLock?.();
+        const side = Math.round(Math.min(lastW, lastH) * MAP_PANEL_FRAC);
+        mapFrame.style.width = mapFrame.style.height = side + 'px';
+        mapEl.classList.remove('hidden');
+      } else { mapEl.classList.add('hidden'); persist(); discoNew = 0; }
+      drawHud();
     }
 
     // E3 streaming: choose which fine chunks stay meshed — the patch around the surface point under the
@@ -379,6 +488,7 @@ export function mountEarth(task) {
         `<span class="chip">${m.emoji} ${m.title}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
         `<span class="chip">🏔️ peak +${peakAbove}</span>` +
+        `<span class="chip">🗺️ ${discoveryPct()}%</span>` +
         `<span class="chip">${mode}</span>`;
     }
     function refreshBelt() {
@@ -499,6 +609,8 @@ export function mountEarth(task) {
     on(window, 'keydown', (e) => {
       const k = e.key.toLowerCase();
       if (e.repeat && 'fr'.includes(k)) return;
+      if (k === 'm') { toggleMap(); return; }
+      if (mapOpen) { if (k === 'escape') toggleMap(false); return; }   // map open → freeze all other keys
       if (k === 'h') { legend.classList.toggle('hidden'); return; }
       if (k === 'g') { cycleMode(); return; }
       if (k === 'f') { doPlace(); return; }
@@ -515,12 +627,23 @@ export function mountEarth(task) {
 
     let dragging = false, moved = 0, lastX = 0, lastY = 0;
     on(renderer.domElement, 'pointerdown', (e) => {
+      if (mapOpen) return;
       dragging = true; moved = 0; lastX = e.clientX; lastY = e.clientY;
       velTheta = velPhi = 0; renderer.domElement.style.cursor = 'grabbing';
     });
     on(window, 'pointerup', () => { dragging = false; renderer.domElement.style.cursor = 'grab'; });
+    // map: drag the panel to spin the mini-globe (handlers on the frame, which captures pointer events)
+    let mapDrag = false, mapLX = 0, mapLY = 0;
+    on(mapFrame, 'pointerdown', (e) => { mapDrag = true; mapLX = e.clientX; mapLY = e.clientY; mapFrame.setPointerCapture?.(e.pointerId); });
+    on(mapFrame, 'pointermove', (e) => {
+      if (!mapDrag) return;
+      mapTheta -= (e.clientX - mapLX) * 0.006;
+      mapPhi = Math.max(0.12, Math.min(Math.PI - 0.12, mapPhi - (e.clientY - mapLY) * 0.006));
+      mapLX = e.clientX; mapLY = e.clientY;
+    });
+    on(mapFrame, 'pointerup', () => { mapDrag = false; });
     on(renderer.domElement, 'pointermove', (e) => {
-      if (camMode === 'walk' || !dragging) return;        // walk uses pointer-lock mouse-look instead
+      if (mapOpen || camMode === 'walk' || !dragging) return;   // walk uses pointer-lock mouse-look instead
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       moved += Math.abs(dx) + Math.abs(dy);
       if (camMode === 'orbit') {
@@ -541,6 +664,7 @@ export function mountEarth(task) {
       wpitch = Math.max(-1.4, Math.min(1.4, wpitch - e.movementY * MOUSE_SENS));
     });
     on(renderer.domElement, 'click', () => {
+      if (mapOpen) return;
       if (camMode === 'walk') {
         if (!pointerLocked) { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); return; }
         tool === 'place' ? doPlace() : doMine();
@@ -549,6 +673,7 @@ export function mountEarth(task) {
       if (moved <= 6) tool === 'place' ? doPlace() : doMine();
     });
     on(renderer.domElement, 'wheel', (e) => {
+      if (mapOpen) return;
       e.preventDefault();
       const f = 1 + Math.sign(e.deltaY) * 0.1;
       if (camMode === 'orbit') camDist = Math.max(DIST_MIN, Math.min(DIST_MAX, camDist * f));
@@ -714,7 +839,37 @@ export function mountEarth(task) {
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
       updateStreaming(6);                                  // E3: load/unload fine chunks around the camera
-      renderer.render(scene, camera);
+
+      // map discovery: reveal the region under the player (+ its ring) as you roam (fly/walk only)
+      if (planet && !mapOpen && (camMode === 'fly' || camMode === 'walk')) {
+        const ci = columns[nearestColumn(anchor.x, anchor.y, anchor.z)]?.chunk;
+        if (ci != null && ci >= 0 && !discovered.has(ci)) {
+          reveal(ci); for (const nb of chunkScanArr[ci]) reveal(nb);
+          if (discoNew >= DISCO_SAVE_EVERY) { persist(); discoNew = 0; }
+        }
+      }
+
+      renderer.render(scene, camera);                      // pass 1 — the live world
+
+      // pass 2 — the world-map mini-globe, drawn into a centered square scissor inset while open
+      if (mapOpen && mapMesh) {
+        ensureMapScene();
+        if (mapDirty) { mapMesh.geometry.attributes.color.needsUpdate = true; mapDirty = false; }
+        updateMapMarkers(); placeMapCamera();
+        const dpr = renderer.getPixelRatio();
+        const side = Math.round(Math.min(lastW, lastH) * MAP_PANEL_FRAC);
+        const px = Math.round((lastW - side) / 2), py = Math.round((lastH - side) / 2);
+        const sx = Math.round(px * dpr), sw = Math.round(side * dpr), sh = Math.round(side * dpr);
+        const sy = Math.round((lastH - py - side) * dpr);   // GL viewport is bottom-origin
+        const prevTest = renderer.getScissorTest();
+        renderer.setScissorTest(true);
+        renderer.setScissor(sx, sy, sw, sh); renderer.setViewport(sx, sy, sw, sh);
+        renderer.autoClear = false;
+        renderer.setClearColor(0x0b1220, 1); renderer.clear(true, true, false);
+        renderer.render(mapScene, mapCam);
+        renderer.setViewport(0, 0, lastW, lastH); renderer.setScissor(0, 0, lastW, lastH);
+        renderer.setScissorTest(prevTest); renderer.autoClear = true;
+      }
     }
 
     refreshBelt();
@@ -729,7 +884,9 @@ export function mountEarth(task) {
     function onDone() {
       let coarseTris = 0;
       if (coarseMeshes) for (const m of coarseMeshes) coarseTris += (m.geometry.attributes.position?.count || 0) / 3;
-      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, coarseTris, fineTris: 0, activeChunks: 0, seed };
+      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, coarseTris, fineTris: 0, activeChunks: 0, seed,
+        get mapOpen() { return mapOpen; }, get discovered() { return discovered.size; }, get discoveryPct() { return discoveryPct(); },
+        get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
       if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand
@@ -773,6 +930,10 @@ export function mountEarth(task) {
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
       if (beacon) { scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose(); }
       if (coarseMeshes) { for (const m of coarseMeshes) { scene.remove(m); m.geometry.dispose(); } coarseMat.dispose(); }
+      if (planet) persist();                               // flush discovered regions before teardown
+      if (mapMesh) { mapMesh.geometry.dispose(); mapMesh.material.dispose(); }
+      if (mapMarkPlayer) { mapMarkPlayer.geometry.dispose(); mapMarkPlayer.material.dispose(); }
+      if (mapMarkPeak) { mapMarkPeak.geometry.dispose(); mapMarkPeak.material.dispose(); }
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });
