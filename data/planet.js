@@ -4,7 +4,7 @@
 
 export const FREQ = 290;      // icosphere subdivision frequency → 10·FREQ²+2 = 841,002 columns (E4: ~4× bigger)
 export const LAYERS = 128;    // radial voxel shells per column (build ceiling) — E4: 4× deeper for very tall mountains + deep digging
-export const TERRAIN_VERSION = 2;  // bump when terrainFill output changes → the save guard discards edits placed against the old world
+export const TERRAIN_VERSION = 3;  // bump when terrainFill output changes → the save guard discards edits placed against the old world
 export const CORE_L = 4;      // solid core boundary layer (below this is always solid core)
 export const SEA_L = 12;      // default sea level layer
 

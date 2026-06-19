@@ -49,15 +49,16 @@ export function mountEarth(task) {
   const belt = el('div.tool-belt.earth-belt');
   const legend = el('div.earth-legend');
   legend.innerHTML =
-    '<b>Controls</b><br>G — mode: Orbit / Fly / Walk<br>W A S D — move<br>' +
-    'Q / E — zoom / altitude<br>Walk: mouse — look · Space — jump<br>' +
-    'F — place · R — mine<br>C / V — material<br>1 / 2 — Place / Mine<br>M — world map<br>H — hide this';
+    '<b>Controls</b><br>Click — look around<br>W A S D — walk · Space — jump<br>' +
+    'X — hover (fly) · Q / E — up / down<br>F — place · R — mine<br>' +
+    'B / C / V — materials<br>1 / 2 — Place / Mine<br>M — world map<br>H — hide this';
   const overlay = el('div.earth-loading', { text: 'Generating planet…' });
   const mapEl = el('div.earth-map.hidden', {
     html: '<div class="earth-map-frame"><div class="earth-map-title">World Map · drag to spin · M / Esc to close</div></div>',
   });
   const mapFrame = mapEl.querySelector('.earth-map-frame');
-  stage.append(view, hud, reticle, belt, legend, overlay, mapEl);
+  const matPanel = el('div.earth-matpanel.hidden');                // material picker (built in refreshBelt)
+  stage.append(view, hud, reticle, belt, legend, overlay, mapEl, matPanel);
   screen.append(stage);
 
   // Deferred build: paint the overlay first, then do the heavy generation one tick later.
@@ -481,7 +482,7 @@ export function mountEarth(task) {
     // ---- HUD + tool belt ----
     function drawHud() {
       const m = MATERIALS[matIdx];
-      const mode = camMode === 'fly' ? '🛩️ Fly' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
+      const mode = camMode === 'fly' ? '🚁 Hover' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
       hud.innerHTML =
         `<span class="chip">🌍 ${columns ? columns.length : 0}</span>` +
         `<span class="chip">${tool === 'place' ? '🧱 Place' : '⛏️ Mine'}</span>` +
@@ -491,20 +492,42 @@ export function mountEarth(task) {
         `<span class="chip">🗺️ ${discoveryPct()}%</span>` +
         `<span class="chip">${mode}</span>`;
     }
+    // belt = the two tools + ONE "Materials" button (current pick); the full swatch grid lives in a panel.
     function refreshBelt() {
       belt.innerHTML = '';
+      const mm = MATERIALS[matIdx];
       belt.append(
         el('button.tool-btn' + (tool === 'place' ? '.active' : ''), { text: '🧱 Place', onclick: () => { tool = 'place'; refreshBelt(); drawHud(); } }),
         el('button.tool-btn' + (tool === 'mine' ? '.active' : ''), { text: '⛏️ Mine', onclick: () => { tool = 'mine'; refreshBelt(); drawHud(); } }),
+        el('button.mat-toggle' + (matPanelOpen ? '.active' : ''), {
+          html: `<span class="sw" style="--sw:#${mm.color.toString(16).padStart(6, '0')}"></span> ${mm.emoji} ${mm.title} ▾`,
+          title: 'Materials (B)', onclick: () => toggleMatPanel(),
+        }),
       );
-      MATERIALS.forEach((mm, i) => belt.append(
-        el('button.mat-btn' + (i === matIdx ? '.active' : ''), {
-          text: mm.emoji, title: mm.title,
-          style: `--sw:#${mm.color.toString(16).padStart(6, '0')}`,
-          onclick: () => { matIdx = i; refreshBelt(); drawHud(); },
-        })));
     }
-    function cycleMat(d) { matIdx = (matIdx + d + MATERIALS.length) % MATERIALS.length; refreshBelt(); drawHud(); }
+    let matPanelOpen = false;
+    function toggleMatPanel(force) {
+      matPanelOpen = force == null ? !matPanelOpen : force;
+      if (matPanelOpen) {
+        matPanel.innerHTML = '';
+        for (const kind of ['terrain', 'block']) {
+          const group = el('div.matpanel-group');
+          group.append(el('div.matpanel-label', { text: kind === 'terrain' ? 'Terrain' : 'Blocks' }));
+          MATERIALS.forEach((mm, i) => {
+            if (mm.kind !== kind) return;
+            group.append(el('button.mat-btn' + (i === matIdx ? '.active' : ''), {
+              text: mm.emoji, title: mm.title,
+              style: `--sw:#${mm.color.toString(16).padStart(6, '0')}`,
+              onclick: () => { matIdx = i; toggleMatPanel(false); refreshBelt(); drawHud(); },
+            }));
+          });
+          matPanel.append(group);
+        }
+        matPanel.classList.remove('hidden');
+      } else matPanel.classList.add('hidden');
+      refreshBelt();
+    }
+    function cycleMat(d) { matIdx = (matIdx + d + MATERIALS.length) % MATERIALS.length; if (matPanelOpen) toggleMatPanel(true); refreshBelt(); drawHud(); }
 
     // ---- camera: orbit (from space) → fly (over the surface) → walk (on the ground) ----
     let camMode = 'orbit';
@@ -531,24 +554,17 @@ export function mountEarth(task) {
       anchor.copy(tmpA); reorthoFly();
     }
     function jump() { if (grounded) { velR = JUMP_V; grounded = false; } }
-    function cycleMode() {                                // Orbit → Fly → Walk → Orbit
-      if (camMode === 'orbit') {
-        camMode = 'fly';
-        camDistSaved = camDist;
-        anchor.copy(camera.position).normalize();
-        fwd.set(0, 1, 0); reorthoFly();
-        alt = 2.5;
-      } else if (camMode === 'fly') {
-        camMode = 'walk';
-        feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.3;   // start looking slightly down at the ground
-        renderer.domElement.requestPointerLock?.()?.catch?.(() => {});   // mouse-look; ignore reject (e.g. embedded preview)
-      } else {
-        camMode = 'orbit';
+    // X toggles between WALK (feet on the ground) and HOVER (free-fly at altitude). Orbit is retired —
+    // it survives only as the transient "watch it generate from space" load view (set in onDone → walk).
+    function toggleHover() {
+      if (camMode === 'walk') {
+        camMode = 'fly';                                 // → hover (keep the current heading `fwd`)
         if (document.pointerLockElement) document.exitPointerLock?.();
-        camPhi = Math.acos(THREE.MathUtils.clamp(anchor.y, -1, 1));
-        camTheta = Math.atan2(anchor.x, anchor.z); clampPhi();
-        camDist = Math.max(DIST_MIN, Math.min(DIST_MAX, camDistSaved));
-        velTheta = velPhi = 0;
+        lookAhead = 0.2; alt = Math.max(FLY_ALT_MIN, 3.0);
+      } else {
+        camMode = 'walk';                                // → land
+        feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.2;
+        renderer.domElement.requestPointerLock?.()?.catch?.(() => {});   // mouse-look; ignore reject (embedded preview)
       }
       drawHud();
     }
@@ -612,7 +628,8 @@ export function mountEarth(task) {
       if (k === 'm') { toggleMap(); return; }
       if (mapOpen) { if (k === 'escape') toggleMap(false); return; }   // map open → freeze all other keys
       if (k === 'h') { legend.classList.toggle('hidden'); return; }
-      if (k === 'g') { cycleMode(); return; }
+      if (k === 'x') { toggleHover(); return; }              // walk ⇄ hover
+      if (k === 'b') { toggleMatPanel(); return; }           // materials picker
       if (k === 'f') { doPlace(); return; }
       if (k === 'r') { doMine(); return; }
       if (k === 'c') { cycleMat(1); return; }
@@ -881,12 +898,42 @@ export function mountEarth(task) {
     // freeze). Edits stay on main (local planet.rebuild). Falls back to in-main generation if Workers
     // are unavailable, so the offline PWA still works on any engine. ----
     let worker = null;
+    // drop the player onto solid LAND in walk mode (the orbit view was only for the load). If the start
+    // direction (0,0,1) is ocean, BFS outward over neighbours to the nearest land column.
+    function spawnOnLand() {
+      // a clean spawn = solid GROUND on top (a 'terrain' material), not water and not a tree block
+      // (wood/leaves are kind 'block', so spawning never lands you on a canopy)
+      const isLand = (id) => { const t = store.getTop(id); if (t <= SEA_L) return false; const mk = MATERIALS[store.getMat(id, t) - 1]; return mk && mk.kind === 'terrain' && mk.id !== 'water'; };
+      let spawn = Math.max(0, nearestColumn(0, 0, 1));
+      if (!isLand(spawn)) {
+        const seen = new Set([spawn]); let frontier = [spawn];
+        search: for (let d = 0; d < 80 && frontier.length; d++) {
+          const next = [];
+          for (const id of frontier) for (const nb of columns[id].neighbors) {
+            if (nb < 0 || seen.has(nb)) continue;
+            seen.add(nb);
+            if (isLand(nb)) { spawn = nb; break search; }
+            next.push(nb);
+          }
+          frontier = next;
+        }
+      }
+      anchor.copy(columns[spawn].center);
+      fwd.set(anchor.z, 0, -anchor.x); if (fwd.lengthSq() < 1e-6) fwd.set(1, 0, 0); fwd.normalize(); reorthoFly();
+      feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.1;
+      camMode = 'walk'; camSurfR = feetR; placeWalkCamera();
+      const ci = columns[spawn].chunk;                     // discover the spawn region
+      if (ci >= 0) { reveal(ci); for (const nb of chunkScanArr[ci]) reveal(nb); }
+    }
     function onDone() {
       let coarseTris = 0;
       if (coarseMeshes) for (const m of coarseMeshes) coarseTris += (m.geometry.attributes.position?.count || 0) / 3;
+      if (columns) spawnOnLand();                          // land the player before handing off to the loop
       window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, coarseTris, fineTris: 0, activeChunks: 0, seed,
         get mapOpen() { return mapOpen; }, get discovered() { return discovered.size; }, get discoveryPct() { return discoveryPct(); },
-        get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; } };
+        get camMode() { return camMode; },
+        get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; },
+        get spawnTopMat() { const id = nearestColumn(anchor.x, anchor.y, anchor.z); return id < 0 ? -1 : store.getMat(id, store.getTop(id)); } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
       if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand

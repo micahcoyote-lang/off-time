@@ -179,10 +179,10 @@ export function terrainFill(columns, seed) {
     if (s <= SEA_L) continue;                              // land above sea only
     const base = col.id * LAYERS, topM = cells[base + s];
     let type, density;
-    if (topM === NUM.forest) { type = 'broadleaf'; density = 0.22; }
-    else if (topM === NUM.grass) { type = 'broadleaf'; density = 0.06; }   // scattered
-    else if (topM === NUM.jungle) { type = 'jungle'; density = 0.30; }
-    else if (topM === NUM.taiga) { type = 'pine'; density = 0.26; }
+    if (topM === NUM.forest) { type = 'broadleaf'; density = 0.10; }       // spaced so you can walk through
+    else if (topM === NUM.grass) { type = 'broadleaf'; density = 0.05; }   // scattered
+    else if (topM === NUM.jungle) { type = 'jungle'; density = 0.13; }
+    else if (topM === NUM.taiga) { type = 'pine'; density = 0.15; }
     else if (topM === NUM.savanna) { type = 'acacia'; density = 0.04; }    // sparse
     else continue;                                         // none on sand/snow/tundra/mesa/rock/peaks
     if (thash(col.id) > density) continue;
