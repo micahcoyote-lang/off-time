@@ -29,7 +29,7 @@ export const cellIndex = (colId, L) => colId * LAYERS + L;
 export const terrainMeta = { river: null };
 
 /* ---- seeded value-noise fBm (no deps) ---- */
-function makeNoise(seed) {
+export function makeNoise(seed) {
   const s = seed | 0;
   function hash(i, j, k) {
     let h = s | 0;
