@@ -23,7 +23,8 @@ import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfa
 import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS,
-  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE } from '../../data/planet.js';
+  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE,
+  ROT_MASK, packState, ORIENTED } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
@@ -613,11 +614,11 @@ export function mountEarth(task) {
       for (const nb of columns[colId].neighbors) if (nb >= 0) s.add(columns[nb].chunk);
       return s;
     }
-    function applyEdit(colId, L, m, shape = SHAPE_FULL) {
+    function applyEdit(colId, L, m, state = 0) {
       const ci = cellIndex(colId, L);
       store.setMat(colId, L, m); edits.set(ci, m);
-      // per-block shape state (Phase 2): only blocks carry it; mining (AIR) or a full block clears it
-      const st = (m === AIR ? 0 : (shape & SHAPE_MASK));
+      // per-block state (Phase 2): shape (low bits) + orientation; mining (AIR) clears it
+      const st = (m === AIR ? 0 : (state & (SHAPE_MASK | ROT_MASK)));
       store.setState(colId, L, st); if (st) editStates.set(ci, st); else editStates.delete(ci);
       // re-mesh only affected chunks that are currently streamed-in; others have the store updated and
       // will mesh correctly when next activated.
@@ -631,7 +632,19 @@ export function mountEarth(task) {
     function doPlace() {
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
       if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
-      applyEdit(target.placeColId, target.placeL, matNum(), heldShape);
+      const rot = ORIENTED.has(heldShape) ? paneRot(target.placeColId) : 0;   // oriented shapes face the player
+      applyEdit(target.placeColId, target.placeL, matNum(), packState(heldShape, rot));
+    }
+    // pick the hex-edge diameter a pane/wall should span so it faces the player (⟂ to the view direction)
+    const _pr1 = new THREE.Vector3(), _pr2 = new THREE.Vector3(), _pr3 = new THREE.Vector3();
+    function paneRot(colId) {
+      const col = columns[colId], C = col.center, b = col.boundary, nb = b.length;
+      _pr1.copy(fwd).addScaledVector(C, -fwd.dot(C));                          // view direction in the cell's tangent plane
+      if (_pr1.lengthSq() < 1e-6) return 0;
+      _pr2.crossVectors(C, _pr1).normalize();                                  // diameter ⟂ view → the wall faces you
+      let best = 0, bd = -2;
+      for (let k = 0; k < nb; k++) { _pr3.copy(b[k]).add(b[(k + 1) % nb]).normalize(); const d = Math.abs(_pr3.dot(_pr2)); if (d > bd) { bd = d; best = k; } }
+      return best;
     }
     function doMine() {
       if (!target) return;
@@ -663,6 +676,8 @@ export function mountEarth(task) {
         heldGroup.rotation.set(0.55, 0.6, 0);
         if (heldShape === SHAPE_FENCE) {
           heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.035, 0.05, 0.24, 6), MATERIALS[matIdx].color, 0, 0, 0));   // a fence post
+        } else if (heldShape === SHAPE_PANE) {
+          heldGroup.add(vmBox(0.19, 0.19, 0.022, MATERIALS[matIdx].color, 0, 0, 0));   // a thin pane
         } else {
           const full = heldShape === SHAPE_FULL, h = full ? 0.13 : 0.065;     // slabs are half-height
           const yOff = full ? 0 : (heldShape === SHAPE_SLAB_HI ? 0.0325 : -0.0325);

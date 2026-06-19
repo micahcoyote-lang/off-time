@@ -13,7 +13,7 @@
 import * as THREE from '../../assets/vendor/three.module.js';
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
   WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE,
-  SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, TH } from '../../data/planet.js';
+  SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, ROT_SHIFT, TH } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -368,7 +368,18 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
     const colors = matn === WATER_NUM ? wCol : sCol;
     // block shape (Phase 2): full hexel, half-height slab, or a custom mesh block. Water is never shaped.
-    const shape = (hasStates && matn !== WATER_NUM) ? (s.getState(id, L) & SHAPE_MASK) : 0;
+    const st = (hasStates && matn !== WATER_NUM) ? s.getState(id, L) : 0;
+    const shape = st & SHAPE_MASK;
+
+    // PANE (oriented mesh block): a thin full-height wall across the cell along the rotation's diameter.
+    if (shape === SHAPE_PANE) {
+      const rot = (st >> ROT_SHIFT) & 7, rIn = radius(L), rOut = radius(L + 1), rMid = (rIn + rOut) / 2, o = (rot + (n >> 1)) % n;
+      _fUp.copy(bnd[rot % n]).add(bnd[(rot + 1) % n]).normalize(); _fA.copy(_fUp).multiplyScalar(rMid);       // one end (edge `rot`)
+      _fUp.copy(bnd[o]).add(bnd[(o + 1) % n]).normalize(); _fB.copy(_fUp).multiplyScalar(rMid);               // other end (opposite edge)
+      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]);
+      emitBar(_fA, _fB, col.center, 0.018, (rOut - rIn) / 2, _sideC, positions, colors);
+      continue;
+    }
 
     // FENCE (mesh block): a centre post + rails auto-connecting to each adjacent solid/fence cell.
     if (shape === SHAPE_FENCE) {

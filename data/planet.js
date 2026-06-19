@@ -80,13 +80,19 @@ export const PLANET_TOOLS = [
 // ---- block shapes (Phase 2 building depth) ----
 // A placed block's per-cell STATE (VoxelStore sparse map) stores a shape id in its low bits; 0 = a full
 // hexel (default, no state stored). Slabs fill half the cell's radial band. Append-only (ids persist in saves).
-export const SHAPE_FULL = 0, SHAPE_SLAB_LO = 1, SHAPE_SLAB_HI = 2, SHAPE_FENCE = 3;
-export const SHAPE_MASK = 0x7;            // low 3 bits = shape (rotation/light reserved for higher bits)
+export const SHAPE_FULL = 0, SHAPE_SLAB_LO = 1, SHAPE_SLAB_HI = 2, SHAPE_FENCE = 3, SHAPE_PANE = 4;
+export const SHAPE_MASK = 0x7;            // low 3 bits = shape
+export const ROT_SHIFT = 3, ROT_MASK = 0x38;   // bits 3-5 = orientation (0..5 = a hex edge); for panes/stairs
+export const packState = (shape, rot = 0) => (shape & SHAPE_MASK) | ((rot & 7) << ROT_SHIFT);
+export const stateShape = (st) => st & SHAPE_MASK;
+export const stateRot = (st) => (st >> ROT_SHIFT) & 7;
+export const ORIENTED = new Set([SHAPE_PANE]);   // shapes whose placement records a facing (rotation)
 export const SHAPES = [
   { id: SHAPE_FULL,    title: 'Block',     tag: '⬢' },     // full hexel
   { id: SHAPE_SLAB_LO, title: 'Slab',      tag: '▄' },     // bottom half
   { id: SHAPE_SLAB_HI, title: 'Top Slab',  tag: '▀' },     // top half
   { id: SHAPE_FENCE,   title: 'Fence',     tag: '⌗' },     // post + auto-connecting rails (mesh block)
+  { id: SHAPE_PANE,    title: 'Pane',      tag: '▮' },     // thin vertical wall across the cell (oriented)
 ];
 
 export function getPlanetMaterial(id) {
