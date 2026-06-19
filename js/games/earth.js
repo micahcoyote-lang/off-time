@@ -59,7 +59,8 @@ export function mountEarth(task) {
   const mapFrame = mapEl.querySelector('.earth-map-frame');
   const matPanel = el('div.earth-matpanel.hidden');                // material picker (built in refreshBelt)
   const hint = el('div.earth-hint.hidden');                        // transient "need a pickaxe" toast
-  stage.append(view, hud, reticle, belt, legend, overlay, mapEl, matPanel, hint);
+  const compass = el('div.earth-compass.hidden');                  // scrolling heading + landmark bearings (P1b)
+  stage.append(view, hud, reticle, belt, legend, overlay, mapEl, matPanel, hint, compass);
   screen.append(stage);
 
   // Deferred build: paint the overlay first, then do the heavy generation one tick later.
@@ -167,16 +168,20 @@ export function mountEarth(task) {
     // ---- world data (streamed from the worker's `topology` message; see the worker block below) ----
     // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
     // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
-    let columns = null, store = null, planet = null, beacon = null;
+    let columns = null, store = null, planet = null;
     let coarseMeshes = null, coarseMat = null;           // per-chunk LOD globe (hidden where fine streams in)
     let N = 0, pentagonCount = 0, chunkCount = 0;
     let cx, cy, cz, chunkCols, chCx, chCy, chCz, chEmpty, chunkScanArr;
     let peakCol = 0, peakL = 0, peakAbove = 0;
     const activeSet = new Set();                          // fine chunk ids currently meshed (E3 streaming)
 
+    // ---- landmarks (P1b): named peaks/water bodies you discover; in-world signposts + compass ----
+    let landmarks = [], beacons = [];                    // registry + their in-world signpost meshes
+    const discoveredLandmarks = new Set();               // landmark ids the player has visited (persisted)
+
     // ---- world map (P1a): a rotatable biome mini-globe + discovery fog ----
     let mapMesh = null, mapBaseCol = null, mapCol = null, mapChunkVtx = null, mapDirty = false;  // merged coarse globe
-    let mapScene = null, mapCam = null, mapMarkPlayer = null, mapMarkPeak = null;
+    let mapScene = null, mapCam = null, mapMarkPlayer = null, mapMarks = [];
     let mapOpen = false, mapTheta = 0.6, mapPhi = 1.05, fogInited = false;
     const discovered = new Set();                         // chunk ids the player has visited
     let discoNew = 0;                                     // new regions since last persist (save throttle)
@@ -206,8 +211,9 @@ export function mountEarth(task) {
       for (const ed of saved.edits) if (ed && ed.c >= 0) edits.set(ed.c, ed.m);
     }
     if (compatible && Array.isArray(saved.discovered)) for (const ci of saved.discovered) discovered.add(ci);
+    if (compatible && Array.isArray(saved.discoveredLandmarks)) for (const id of saved.discoveredLandmarks) discoveredLandmarks.add(id);
     function persist() {
-      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered] });
+      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered], discoveredLandmarks: [...discoveredLandmarks] });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
@@ -250,18 +256,57 @@ export function mountEarth(task) {
       planet = buildPlanetChunks(columns, store, chunkCount, sunDir);
       planet.meshes.forEach((m) => scene.add(m));
 
-      // tallest peak → gold beacon
+      // tallest peak (feeds the landmark registry + the HUD)
       let peakR = -1;
       for (let i = 0; i < N; i++) {
         const top = store.getTop(i);
         if (top >= 0) { const r = radius(top + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = top; } }
       }
       peakAbove = peakL + 1 - SEA_L;
-      beacon = new THREE.Mesh(new THREE.ConeGeometry(0.18, 2.2, 8), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
-      beacon.position.copy(columns[peakCol].center).multiplyScalar(peakR + 1.1);
-      beacon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), columns[peakCol].center);   // point outward (radial)
-      beacon.frustumCulled = false; scene.add(beacon);
+      scanLandmarks();                                   // registry + in-world signposts
       drawHud();
+    }
+
+    // ---- landmark registry: the top spatially-separated PEAKS + the biggest inland LAKE (deterministic) ----
+    const isLandCol = (id) => { const t = store.getTop(id); return t > SEA_L && store.getMat(id, t) !== WATER; };
+    const latBand = (y) => y > 0.33 ? 'Northern' : y < -0.33 ? 'Southern' : 'Equatorial';
+    function scanLandmarks() {
+      const mk = (kind, name, colId) => ({ id: landmarks.length, kind, name, colId, center: columns[colId].center, radius: surfaceRadiusAt(columns[colId].center), chunk: columns[colId].chunk, aboveSea: store.getTop(colId) + 1 - SEA_L });
+      landmarks = [];
+      // PEAKS: greedily take the highest land columns that are ≥ MINSEP apart → distinct mountains world-wide
+      const cand = [];
+      for (let i = 0; i < N; i++) { if (isLandCol(i) && store.getTop(i) - SEA_L > 14) cand.push(i); }
+      cand.sort((a, b) => store.getTop(b) - store.getTop(a));
+      const MINSEP = Math.cos(0.5), picks = [], used = {};
+      for (const id of cand) {
+        if (picks.length >= 5) break;
+        const c = columns[id].center; let ok = true;
+        for (const p of picks) if (columns[p].center.dot(c) > MINSEP) { ok = false; break; }
+        if (!ok) continue; picks.push(id);
+        let nm = picks.length === 1 ? 'Tallest Peak' : `${latBand(c.y)} Peak`;
+        const key = nm; if (used[key]) nm += ` ${used[key] + 1}`; used[key] = (used[key] || 0) + 1;
+        landmarks.push(mk('peak', nm, id));
+      }
+      // LAKE: flood-fill water bodies; the largest is the ocean (skip), the next sizable one is a lake
+      const seen = new Uint8Array(N), waters = [];
+      for (let s = 0; s < N; s++) {
+        if (seen[s] || isLandCol(s)) { seen[s] = 1; continue; }
+        seen[s] = 1; let size = 0; const stack = [s]; let any = s;
+        while (stack.length) { const id = stack.pop(); size++; any = id; for (const nb of columns[id].neighbors) if (nb >= 0 && !seen[nb] && !isLandCol(nb)) { seen[nb] = 1; stack.push(nb); } }
+        waters.push({ size, col: any });
+      }
+      waters.sort((a, b) => b.size - a.size);
+      if (waters[1] && waters[1].size > 30) landmarks.push(mk('water', 'Great Lake', waters[1].col));
+      // in-world signposts (a modest post + sign board, not a glowing tower)
+      for (const lm of landmarks) { const sp = makeSignpost(lm.kind); sp.position.copy(lm.center).multiplyScalar(lm.radius); sp.quaternion.setFromUnitVectors(UP_Y, lm.center); sp.frustumCulled = false; scene.add(sp); beacons.push(sp); }
+    }
+    const UP_Y = new THREE.Vector3(0, 1, 0);
+    function spBox(w, h, d, hex, y) { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color: hex })); m.position.y = y; m.castShadow = true; return m; }
+    function makeSignpost(kind) {
+      const g = new THREE.Group();
+      g.add(spBox(0.07, 1.4, 0.07, 0x6b4a2e, 0.7));        // post rises along local +Y from the surface
+      g.add(spBox(0.62, 0.34, 0.05, kind === 'water' ? 0x3f9fc4 : 0xd8a93a, 1.18));   // sign board near the top
+      return g;
     }
     // worker `topology` message → reconstruct lightweight column objects, then set up the world.
     // `d.cells` already has the saved edits applied (the worker did it).
@@ -353,7 +398,8 @@ export function mountEarth(task) {
       mapScene.add(mapMesh);
       mapCam = new THREE.PerspectiveCamera(40, 1, R * 0.05, R * 8);
       const mk = (h) => { const m = new THREE.Mesh(new THREE.ConeGeometry(R * 0.03, R * 0.13, 8), new THREE.MeshBasicMaterial({ color: h })); m.frustumCulled = false; return m; };
-      mapMarkPlayer = mk(0x4ade80); mapMarkPeak = mk(0xffd34d); mapScene.add(mapMarkPlayer, mapMarkPeak);
+      mapMarkPlayer = mk(0x4ade80); mapScene.add(mapMarkPlayer);
+      mapMarks = landmarks.map((lm) => { const m = mk(lm.kind === 'water' ? 0x3f9fc4 : 0xffd34d); mapScene.add(m); return m; });
     }
     const _msph = new THREE.Spherical(), _mup = new THREE.Vector3(0, 1, 0);
     function placeMapCamera() {
@@ -370,8 +416,46 @@ export function mountEarth(task) {
       if (!columns) return;
       const pdir = camMode === 'orbit' ? _mpd.copy(camera.position).normalize() : anchor;
       placeRadialMarker(mapMarkPlayer, pdir, true);
-      const peakCi = columns[peakCol].chunk;
-      placeRadialMarker(mapMarkPeak, columns[peakCol].center, peakCi >= 0 && discovered.has(peakCi));
+      for (let i = 0; i < landmarks.length; i++) if (mapMarks[i]) placeRadialMarker(mapMarks[i], landmarks[i].center, discoveredLandmarks.has(landmarks[i].id));
+    }
+
+    // ---- compass + landmark discovery (P1b) ----
+    const _nT = new THREE.Vector3(), _eT = new THREE.Vector3(), _dT = new THREE.Vector3();
+    // angle of a world direction in the player's tangent plane: 0 = N (toward +Y pole), +90° = E. radians.
+    function bearingOf(dir) {
+      _nT.set(0, 1, 0).addScaledVector(anchor, -anchor.y); if (_nT.lengthSq() < 1e-6) return 0; _nT.normalize();
+      _eT.crossVectors(anchor, _nT);
+      _dT.copy(dir).addScaledVector(anchor, -dir.dot(anchor));     // project dir onto the tangent plane
+      return Math.atan2(_dT.dot(_eT), _dT.dot(_nT));
+    }
+    const wrapPi = (a) => { a = (a + Math.PI) % (2 * Math.PI); return (a < 0 ? a + 2 * Math.PI : a) - Math.PI; };
+    const CARDS = [['N', 0], ['E', Math.PI / 2], ['S', Math.PI], ['W', -Math.PI / 2]];
+    const HALF_FOV = 1.22;                                          // ~70° each side of the heading
+    function updateCompass() {
+      if (mapOpen || camMode === 'orbit' || !landmarks.length) { compass.classList.add('hidden'); return; }
+      compass.classList.remove('hidden');
+      const heading = bearingOf(fwd);
+      const tick = (rel, label, cls) => `<span class="cmp-tick ${cls}" style="left:${(50 + (rel / HALF_FOV) * 50).toFixed(1)}%">${label}</span>`;
+      let html = '<div class="cmp-center"></div>';
+      for (const [lab, b] of CARDS) { const rel = wrapPi(b - heading); if (Math.abs(rel) < HALF_FOV) html += tick(rel, lab, 'cmp-card'); }
+      for (const lm of landmarks) {
+        if (!discoveredLandmarks.has(lm.id)) continue;
+        const rel = wrapPi(bearingOf(lm.center) - heading); if (Math.abs(rel) >= HALF_FOV) continue;
+        const dist = Math.round(Math.acos(Math.max(-1, Math.min(1, anchor.dot(lm.center)))) * R);
+        html += tick(rel, `${lm.kind === 'water' ? '💧' : '🏔️'} ${dist}m`, 'cmp-lm');
+      }
+      compass.innerHTML = html;
+    }
+    function discoverLandmarks() {
+      if (!landmarks.length) return;
+      const pc = nearestColumn(anchor.x, anchor.y, anchor.z); if (pc < 0) return;
+      const pchunk = columns[pc].chunk;
+      for (const lm of landmarks) {
+        if (discoveredLandmarks.has(lm.id)) continue;
+        if (pchunk === lm.chunk || chunkScanArr[lm.chunk].includes(pchunk)) {
+          discoveredLandmarks.add(lm.id); showHint(`🏁 Discovered: ${lm.name}`); persist(); drawHud();
+        }
+      }
     }
     function toggleMap(force) {
       const next = force == null ? !mapOpen : force;
@@ -527,7 +611,7 @@ export function mountEarth(task) {
         `<span class="chip">🌍 ${columns ? columns.length : 0}</span>` +
         `<span class="chip">✋ ${heldLabel()}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
-        `<span class="chip">🏔️ peak +${peakAbove}</span>` +
+        `<span class="chip">🧭 ${discoveredLandmarks.size}/${landmarks.length}</span>` +
         `<span class="chip">🗺️ ${discoveryPct()}%</span>` +
         `<span class="chip">${mode}</span>`;
     }
@@ -899,14 +983,16 @@ export function mountEarth(task) {
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
       updateStreaming(6);                                  // E3: load/unload fine chunks around the camera
 
-      // map discovery: reveal the region under the player (+ its ring) as you roam (fly/walk only)
+      // map discovery + landmark discovery + compass: as you roam (fly/walk only)
       if (planet && !mapOpen && (camMode === 'fly' || camMode === 'walk')) {
         const ci = columns[nearestColumn(anchor.x, anchor.y, anchor.z)]?.chunk;
         if (ci != null && ci >= 0 && !discovered.has(ci)) {
           reveal(ci); for (const nb of chunkScanArr[ci]) reveal(nb);
           if (discoNew >= DISCO_SAVE_EVERY) { persist(); discoNew = 0; }
         }
+        discoverLandmarks();
       }
+      if (planet) updateCompass();
 
       renderer.render(scene, camera);                      // pass 1 — the live world
 
@@ -976,7 +1062,9 @@ export function mountEarth(task) {
         get mapOpen() { return mapOpen; }, get discovered() { return discovered.size; }, get discoveryPct() { return discoveryPct(); },
         get camMode() { return camMode; },
         get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; },
-        get spawnTopMat() { const id = nearestColumn(anchor.x, anchor.y, anchor.z); return id < 0 ? -1 : store.getMat(id, store.getTop(id)); } };
+        get spawnTopMat() { const id = nearestColumn(anchor.x, anchor.y, anchor.z); return id < 0 ? -1 : store.getMat(id, store.getTop(id)); },
+        get landmarks() { return landmarks.map((l) => ({ kind: l.kind, name: l.name, colId: l.colId, aboveSea: l.aboveSea, chunk: l.chunk })); },
+        get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
       if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand
@@ -1018,12 +1106,12 @@ export function mountEarth(task) {
       scene.remove(ghost); ghostGeo.dispose(); ghostMat.dispose();
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
-      if (beacon) { scene.remove(beacon); beacon.geometry.dispose(); beacon.material.dispose(); }
+      for (const b of beacons) { scene.remove(b); b.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); }); }
       if (coarseMeshes) { for (const m of coarseMeshes) { scene.remove(m); m.geometry.dispose(); } coarseMat.dispose(); }
       if (planet) persist();                               // flush discovered regions before teardown
       if (mapMesh) { mapMesh.geometry.dispose(); mapMesh.material.dispose(); }
       if (mapMarkPlayer) { mapMarkPlayer.geometry.dispose(); mapMarkPlayer.material.dispose(); }
-      if (mapMarkPeak) { mapMarkPeak.geometry.dispose(); mapMarkPeak.material.dispose(); }
+      for (const m of mapMarks) { m.geometry.dispose(); m.material.dispose(); }
       for (const c of heldGroup.children) { c.geometry.dispose(); c.material.dispose(); }
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);

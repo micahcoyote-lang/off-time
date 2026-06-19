@@ -451,6 +451,21 @@ body.earth-wide #app { max-width: none; }
 }
 .earth-hint.hidden { display: none; }
 
+/* scrolling compass strip (P1b): cardinals + discovered-landmark bearings */
+.earth-compass {
+  position: absolute; top: 50px; left: 50%; transform: translateX(-50%); z-index: 3; pointer-events: none;
+  width: min(560px, 86vw); height: 28px; overflow: hidden;
+  background: rgba(15,23,42,0.7); border: 1px solid rgba(148,184,255,0.25); border-radius: 8px;
+}
+.earth-compass.hidden { display: none; }
+.earth-compass .cmp-center { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: rgba(255,255,255,0.55); transform: translateX(-1px); }
+.earth-compass .cmp-tick {
+  position: absolute; top: 50%; transform: translate(-50%, -50%); white-space: nowrap;
+  font-weight: 800; font-size: 0.8rem; line-height: 1;
+}
+.earth-compass .cmp-card { color: #cbd5e1; }
+.earth-compass .cmp-lm { color: #ffe6a3; font-size: 0.74rem; }
+
 .earth-loading {
   position: absolute; inset: 0; z-index: 4;
   display: flex; align-items: center; justify-content: center;
