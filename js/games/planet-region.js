@@ -22,7 +22,7 @@
 
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius } from '../../data/planet.js';
 import { makeNoise } from './planet-mesh.js';
-import { regionColumns, regionSize, centerOf, neighborsOf, encodeId, REGION_EDGE } from './icosphere-address.js';
+import { regionColumns, regionSize, centerOf, neighborsOf, encodeId, decodeId, columnGeometry, REGION_EDGE } from './icosphere-address.js';
 
 const AIR = 0;
 // numeric material ids (rebuilt here to avoid coupling to planet-mesh internals; same order as terrainFill)
@@ -192,8 +192,7 @@ export function genRegion(region, f, seed) {
   return { region, f, size, columns: columns.map((n) => ({ local: (n.base / LAYERS) | 0, id: n.id, center: n.center, s: n.s, topMat: n.topMat })), neighborIds, neighborLens, cells };
 }
 
-/* LRU region cache: holds at most `maxRegions` generated regions; evicts least-recently-used. The store-
-   compaction (palette) + meshing wiring lands in C3 — this is the eviction skeleton + a get-or-generate. */
+/* LRU region cache: holds at most `maxRegions` generated regions; evicts least-recently-used. */
 export class RegionCache {
   constructor(f, seed, maxRegions = 96) { this.f = f; this.seed = seed; this.max = maxRegions; this.map = new Map(); this.tick = 0; }
   get(region) {
@@ -210,4 +209,30 @@ export class RegionCache {
     for (const [k, e] of this.map) if (oldest === null || e.used < oldest) { oldest = e.used; oldKey = k; }
     if (oldKey >= 0) this.map.delete(oldKey);
   }
+}
+
+/* Store-API adapter over a RegionCache, keyed by STRUCTURED column id (encodeId). Exposes exactly the
+   getMat/getTop/getState/setState surface the existing fine-chunk mesher (planet-mesh.js emitColumn /
+   meshChunkArrays) expects, so the mesher is reused UNCHANGED — a neighbour lookup `getMat(nbId, L)` for a
+   column in another region transparently generates that region on demand (cross-region seam culling).
+   Edits mutate the cached region's cells in place; persistence (re-applying on regen/evict) is C4. */
+export class RegionWorld {
+  constructor(cache) { this.cache = cache; this.f = cache.f; this.state = new Map(); }
+  _at(id) { const { region, local } = decodeId(id, this.f); return { cells: this.cache.get(region).cells, base: local * LAYERS }; }
+  getMat(id, L) { const a = this._at(id); return a.cells[a.base + L]; }
+  setMat(id, L, m) { const a = this._at(id); a.cells[a.base + L] = m; }
+  getTop(id) { const a = this._at(id); for (let L = LAYERS - 1; L >= 0; L--) if (a.cells[a.base + L] !== AIR) return L; return -1; }
+  getState(id, L) { return this.state.get(id * LAYERS + L) || 0; }
+  setState(id, L, v) { const ci = id * LAYERS + L; if (v) this.state.set(ci, v); else this.state.delete(ci); }
+}
+
+/* Build the mesher-ready column objects for a region: {id, center, boundary, neighbors:[structured ids],
+   isPentagon} — geometry reconstructed from the address (no global build). Feed these + a RegionWorld to
+   planet-mesh.js meshChunkArrays to mesh the region (with cross-region neighbour culling). */
+export function regionColumnObjects(region, f) {
+  return regionColumns(region, f).map((addr) => {
+    const g = columnGeometry(addr, f);
+    return { id: encodeId(addr.region, addr.local, f), center: g.center, boundary: g.boundary,
+      neighbors: g.neighborAddrs.map((a) => encodeId(a.region, a.local, f)), isPentagon: g.isPentagon };
+  });
 }

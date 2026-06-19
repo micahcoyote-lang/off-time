@@ -240,6 +240,28 @@ function inwardFromEdgeLattice(i, j, f) {
   return [[i, j - 1], [i + 1, j]];                        // on A-C edge (i===j, b=0) → step toward B
 }
 
+// ---- full per-column geometry (centre + ordered boundary + edge-aligned neighbours) ----
+// Reconstructs what hexsphere.js produced per column WITHOUT a global build: the 5/6 boundary vertices
+// (dual = centroids of the geodesic triangles fanning the column) in CCW order, and the neighbour across
+// each boundary edge. `boundary[k]` → `boundary[k+1]` is the edge crossed by `neighborAddrs[k]` — exactly
+// the alignment emitColumn() expects. Verified to match buildHexSphere's boundary/neighbour adjacency.
+const _Y = new THREE.Vector3(0, 1, 0), _X = new THREE.Vector3(1, 0, 0);
+export function columnGeometry(addr, f) {
+  const center = centerOf(addr, f);
+  const nAddrs = neighborsOf(addr, f);
+  const nCent = nAddrs.map((a) => centerOf(a, f));
+  // angular order of neighbours in the tangent plane (same basis convention as hexsphere.js)
+  const up = center.clone();
+  const east = new THREE.Vector3().crossVectors(up, Math.abs(up.y) < 0.99 ? _Y : _X).normalize();
+  const north = new THREE.Vector3().crossVectors(up, east).normalize();
+  const ord = nCent.map((p, k) => ({ k, ang: Math.atan2(p.dot(north), p.dot(east)) })).sort((a, b) => a.ang - b.ang);
+  const oC = ord.map((o) => nCent[o.k]), oA = ord.map((o) => nAddrs[o.k]), m = oC.length;
+  const boundary = [], neighborAddrs = [];
+  for (let k = 0; k < m; k++) boundary.push(oC[k].clone().add(oC[(k + 1) % m]).add(center).normalize());   // dual vertex between consecutive neighbours
+  for (let k = 0; k < m; k++) neighborAddrs.push(oA[(k + 1) % m]);   // neighbour across edge boundary[k]→boundary[k+1]
+  return { center, boundary, neighborAddrs, isPentagon: m === 5 };
+}
+
 // ---- enumerate every column of a region (for on-demand generation in C2) ----
 export function regionColumns(r, f) {
   const out = [];
