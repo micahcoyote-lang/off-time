@@ -11,7 +11,7 @@
    radius(L+1). cell(c, L) = c * LAYERS + L. */
 
 import * as THREE from '../../assets/vendor/three.module.js';
-import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN, WATER_OPACITY,
+import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
   WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
@@ -81,7 +81,10 @@ export function terrainFill(columns, seed) {
     const lat = Math.abs(c.y);                              // 0 equator … 1 pole
     let e = (cont - 0.37) * 3.0 + (detail - 0.5) * 1.1;    // ~55% land (offset 0.52→0.37) + coastline ruggedness
     e -= Math.pow(lat, 3) * 0.30;                           // poles trend lower, but gentler (0.45→0.30)
-    if (e < 0) e *= 1.8;                                    // steepen below sea level → real deep basins + shallow shelves
+    // continental shelf: broad gentle shallows near shore that still deepen to dark basins offshore.
+    // The max(0.13,…) floor keeps every below-sea column at least ~1 layer deep so the coastline (ocean
+    // extent) is unchanged; the pow shape spends most of the shelf shallow but reaches full depth by e≈−0.5.
+    if (e < 0) e = -Math.max(0.13, Math.pow(-e, 1.55) * 2.5);
     let s = Math.round(SEA_L + e * AMP);
     if (e > MTN_E) {                                        // mountain belts: tall ridged ranges only on high land (plains untouched)
       const mf = fbm(c.x * MF - 5.2, c.y * MF + 13.7, c.z * MF - 2.4);
@@ -339,14 +342,19 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
       let walled = 0;
       for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
-      _top.copy(matn === WATER_NUM ? _wcol : COLORS[matn]).multiplyScalar(aoTop);
+      if (matn === WATER_NUM) _top.copy(_wcol);                         // pure depth tint → shader recovers depth for its alpha
+      else _top.copy(COLORS[matn]).multiplyScalar(aoTop);
       const ctr = col.center.clone().multiplyScalar(rOut);
       for (let k = 0; k < n; k++)
         pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _top, _ref, positions, colors);
     }
-    // grass blocks show brown (dirt) on their sides; else darken the material; AO fades wall bottoms
-    _sideC.copy(matn === WATER_NUM ? _wcol : (matn === GRASS_NUM ? DIRT_COL : COLORS[matn])).multiplyScalar(0.82);
-    _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
+    // grass blocks show brown (dirt) on their sides; else darken the material; AO fades wall bottoms.
+    // water sides stay PURE depth tint (no AO/gradient) so the shader can recover depth for its alpha.
+    if (matn === WATER_NUM) { _sideC.copy(_wcol); _sideBot.copy(_wcol); }
+    else {
+      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
+      _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
+    }
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
       if (!(nb < 0 || s.getMat(nb, L) === AIR)) continue;
@@ -415,7 +423,8 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
     uTime: { value: 0 },
     uSunDir: { value: sunDir || new THREE.Vector3(1, 0, 0) },
     uWave: { value: WATER_WAVE },
-    uOpacity: { value: WATER_OPACITY },
+    uShallow: { value: WATER_SHALLOW_C }, uDeep: { value: WATER_DEEP_C },   // the depth-tint endpoints → recover depth in-shader
+    uShoalA: { value: 0.30 }, uDeepA: { value: 0.88 },                       // alpha: see-through shallows → opaque deeps
   };
   const waterMat = new THREE.ShaderMaterial({
     uniforms: waterUniforms,
@@ -433,7 +442,7 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
         gl_Position = projectionMatrix * viewMatrix * wp;
       }`,
     fragmentShader: `
-      uniform vec3 uSunDir; uniform float uOpacity;
+      uniform vec3 uSunDir, uShallow, uDeep; uniform float uShoalA, uDeepA;
       varying vec3 vColor, vWorld, vNormalW;
       void main(){
         vec3 N = normalize(vNormalW);
@@ -446,7 +455,12 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
         vec3 col = vColor * (0.5 + 0.5 * sunEl);
         col += vec3(0.6, 0.75, 0.9) * fres * 0.5;                  // cool fresnel
         col += vec3(1.0, 0.96, 0.85) * spec * sunEl;               // warm sparkle (daylight only)
-        gl_FragColor = vec4(col, clamp(uOpacity + fres * 0.3, 0.0, 1.0));
+        // recover this column's depth (0 shore → 1 basin) by projecting its tint onto the shallow→deep line,
+        // so shallow water is see-through (sandy bottom shows) and deep water reads opaque — like a real sea.
+        vec3 sd = uDeep - uShallow;
+        float dN = clamp(dot(vColor - uShallow, sd) / max(dot(sd, sd), 1e-5), 0.0, 1.0);
+        float alpha = mix(uShoalA, uDeepA, dN) + fres * 0.25;
+        gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
       }`,
   });
 
