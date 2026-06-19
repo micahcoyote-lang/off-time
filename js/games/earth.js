@@ -20,6 +20,7 @@ import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
 import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin } from './planet-mesh.js';
+import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS } from '../../data/planet.js';
 
@@ -160,7 +161,7 @@ export function mountEarth(task) {
     // ---- world data (streamed from the worker's `topology` message; see the worker block below) ----
     // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
     // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
-    let columns = null, cells = null, planet = null, beacon = null;
+    let columns = null, store = null, planet = null, beacon = null;
     let coarseMeshes = null, coarseMat = null;           // per-chunk LOD globe (hidden where fine streams in)
     let N = 0, pentagonCount = 0, chunkCount = 0;
     let cx, cy, cz, chunkCols, chCx, chCy, chCz, chEmpty, chunkScanArr;
@@ -198,7 +199,10 @@ export function mountEarth(task) {
     // Build the picking index + planet meshes + peak beacon from ready column objects (+ cells).
     // Shared by the worker path (reconstruct columns from flat arrays first) and the no-Worker fallback.
     function setupWorld(cols, cellsArr, pentCount, chCount) {
-      columns = cols; cells = cellsArr; pentagonCount = pentCount; chunkCount = chCount; N = cols.length;
+      columns = cols; pentagonCount = pentCount; chunkCount = chCount; N = cols.length;
+      // compact the transient flat grid into the per-chunk palette store (the resident representation);
+      // the flat `cellsArr` is dropped after this — the worker keeps its own copy only until transfer.
+      store = compactToStore(cols, cellsArr, chCount);
       cx = new Float32Array(N); cy = new Float32Array(N); cz = new Float32Array(N);
       for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
       // bucketed index: per-chunk column lists + centroids + neighbour scan sets
@@ -222,16 +226,14 @@ export function mountEarth(task) {
       chunkScanArr = scanSets.map((s) => [...s]);
 
       // fine chunk meshes (created empty; meshed on demand near the camera by updateStreaming)
-      planet = buildPlanetChunks(columns, cells, chunkCount, sunDir);
+      planet = buildPlanetChunks(columns, store, chunkCount, sunDir);
       planet.meshes.forEach((m) => scene.add(m));
 
       // tallest peak → gold beacon
       let peakR = -1;
       for (let i = 0; i < N; i++) {
-        const b = i * LAYERS;
-        for (let L = LAYERS - 1; L >= 0; L--) {
-          if (cells[b + L] !== AIR) { const r = radius(L + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = L; } break; }
-        }
+        const top = store.getTop(i);
+        if (top >= 0) { const r = radius(top + 1); if (r > peakR) { peakR = r; peakCol = i; peakL = top; } }
       }
       peakAbove = peakL + 1 - SEA_L;
       beacon = new THREE.Mesh(new THREE.ConeGeometry(0.18, 2.2, 8), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
@@ -345,8 +347,8 @@ export function mountEarth(task) {
     }
     function applyEdit(colId, L, m) {
       const ci = cellIndex(colId, L);
-      cells[ci] = m; edits.set(ci, m);
-      // re-mesh only affected chunks that are currently streamed-in; others have `cells` updated and
+      store.setMat(colId, L, m); edits.set(ci, m);
+      // re-mesh only affected chunks that are currently streamed-in; others have the store updated and
       // will mesh correctly when next activated.
       const affected = [...affectedChunks(colId)].filter((id) => activeSet.has(id));
       if (affected.length) planet.rebuild(affected);
@@ -356,13 +358,13 @@ export function mountEarth(task) {
     function doPlace() {
       tool = 'place';
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
-      if (cells[cellIndex(target.placeColId, target.placeL)] !== AIR) return;
+      if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
       applyEdit(target.placeColId, target.placeL, matNum());
     }
     function doMine() {
       tool = 'mine';
       if (!target) return;
-      const m = cells[cellIndex(target.colId, target.L)];
+      const m = store.getMat(target.colId, target.L);
       if (m === AIR || m === WATER) return;                // water is a liquid — not mineable
       applyEdit(target.colId, target.L, AIR);
     }
@@ -445,9 +447,8 @@ export function mountEarth(task) {
     function surfaceRadiusAt(v) {
       const best = nearestColumn(v.x, v.y, v.z);
       if (best < 0) return radius(0);
-      const base = best * LAYERS;
-      for (let L = LAYERS - 1; L >= 0; L--) if (cells[base + L] !== AIR) return radius(L + 1);
-      return radius(0);
+      const top = store.getTop(best);
+      return top >= 0 ? radius(top + 1) : radius(0);
     }
     // The floor under the player at direction `v`, given their current feet radius `fromR`. Finds the
     // highest solid (non-water) cell AT OR JUST BELOW the step-up ceiling — so you can stand INSIDE a
@@ -457,12 +458,11 @@ export function mountEarth(task) {
     function groundInfo(v, fromR) {
       const best = nearestColumn(v.x, v.y, v.z);
       if (best < 0) return { solidR: radius(0), waterTopR: 0, headroom: true };
-      const base = best * LAYERS;
       const Lf = Math.max(0, Math.floor((fromR - radius(0)) / TH));
       const ceilL = Math.min(LAYERS - 1, Lf + STEP_LAYERS);
       let floorL = -1, waterTopR = 0;
       for (let L = ceilL; L >= 0; L--) {
-        const m = cells[base + L];
+        const m = store.getMat(best, L);
         if (m === AIR) continue;
         if (m === WATER) { if (waterTopR === 0) waterTopR = radius(L + 1); continue; }
         floorL = L; break;                                    // highest solid at/below the step-up ceiling
@@ -470,7 +470,7 @@ export function mountEarth(task) {
       const solidR = floorL < 0 ? radius(0) : radius(floorL + 1);
       let headroom = true;                                    // body cells above the floor must be air/water
       for (let L = floorL + 1; L <= floorL + BODY_LAYERS && L < LAYERS; L++) {
-        const m = cells[base + L];
+        const m = store.getMat(best, L);
         if (m !== AIR && m !== WATER) { headroom = false; break; }
       }
       return { solidR, waterTopR, headroom };
@@ -593,7 +593,7 @@ export function mountEarth(task) {
         if (col < 0) continue;
         let L = Math.floor((r - _base0) / TH);
         if (L < 0) L = 0; else if (L >= LAYERS) L = LAYERS - 1;
-        if (cells[col * LAYERS + L] !== AIR) return { colId: col, L, placeColId: prevCol, placeL: prevL };
+        if (store.getMat(col, L) !== AIR) return { colId: col, L, placeColId: prevCol, placeL: prevL };
         prevCol = col; prevL = L;
       }
       return null;
@@ -624,7 +624,7 @@ export function mountEarth(task) {
 
       // ghost previews the place cell (the air cell the ray last passed through, adjacent to the hit face)
       if (tool !== 'place' || !target || target.placeColId < 0) { ghost.visible = false; lastGhostKey = ''; return; }
-      const valid = cells[cellIndex(target.placeColId, target.placeL)] === AIR;
+      const valid = store.getMat(target.placeColId, target.placeL) === AIR;
       ghostMat.color.setHex(valid ? 0x4ade80 : 0xf87171);
       const gkey = `${target.placeColId},${target.placeL}`;
       if (gkey !== lastGhostKey) {

@@ -203,31 +203,34 @@ function pushTri(p0, p1, p2, col, ref, positions, colors) {
 }
 
 // emit one column's exposed faces; water faces go to the separate (transparent) buffer.
-// Neighbor lookups span chunks via the global `cells`.
-function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
-  const base = col.id * LAYERS, bnd = col.boundary, neigh = col.neighbors, n = bnd.length;
+// Reads material via the VoxelStore (`s`); neighbour lookups span chunks (the store is the whole planet).
+// Bounded by the column's top (air above it emits nothing) so meshing visits ~tens of layers, not 128.
+function emitColumn(col, s, sPos, sCol, wPos, wCol) {
+  const id = col.id, bnd = col.boundary, neigh = col.neighbors, n = bnd.length;
+  const top = s.getTop(id);
+  if (top < 0) return;
   // depth-graded water tint for this column (shallow shelf → deep basin), computed once
   let waterTop = -1, seabed = -1;
-  for (let L = LAYERS - 1; L >= 0; L--) {
-    const m = cells[base + L];
+  for (let L = top; L >= 0; L--) {
+    const m = s.getMat(id, L);
     if (m === AIR) continue;
     if (waterTop < 0 && m === WATER_NUM) waterTop = L;       // topmost water cell
     if (m !== WATER_NUM) { seabed = L; break; }              // topmost solid below the water
   }
   if (waterTop >= 0) _wcol.copy(WATER_SHALLOW_C).lerp(WATER_DEEP_C, Math.min(1, Math.max(0, waterTop - seabed) / WATER_MAX_DEPTH));
-  for (let L = 0; L < LAYERS; L++) {
-    const matn = cells[base + L];
+  for (let L = 0; L <= top; L++) {
+    const matn = s.getMat(id, L);
     if (matn === AIR) continue;
     const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
     const colors = matn === WATER_NUM ? wCol : sCol;
     const rOut = radius(L + 1), rIn = radius(L);
     _ref.copy(col.center).multiplyScalar((rIn + rOut) / 2);        // this cell's center
 
-    const topAir = (L + 1 >= LAYERS) || cells[base + L + 1] === AIR;
+    const topAir = (L + 1 >= LAYERS) || s.getMat(id, L + 1) === AIR;
     if (topAir) {
       // AO: darken a top face that's hemmed in by taller neighbours (pit floor / wall base)
       let walled = 0;
-      for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && cells[nb * LAYERS + L + 1] !== AIR) walled++; }
+      for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
       _top.copy(matn === WATER_NUM ? _wcol : COLORS[matn]).multiplyScalar(aoTop);
       const ctr = col.center.clone().multiplyScalar(rOut);
@@ -239,7 +242,7 @@ function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
     _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
-      if (!(nb < 0 || cells[nb * LAYERS + L] === AIR)) continue;
+      if (!(nb < 0 || s.getMat(nb, L) === AIR)) continue;
       const aOut = bnd[k].clone().multiplyScalar(rOut), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rOut);
       const aIn = bnd[k].clone().multiplyScalar(rIn), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rIn);
       pushTriC(aOut, bOut, bIn, _sideC, _sideC, _sideBot, _ref, positions, colors);   // top verts bright, bottom dark
@@ -249,12 +252,12 @@ function emitColumn(col, cells, sPos, sCol, wPos, wCol) {
 }
 
 /* Pure meshing for ONE chunk's columns → transferable Float32Arrays (no THREE.BufferGeometry, no DOM).
-   Worker-safe: this is what the Web Worker (planet-worker.js) runs to mesh chunks off the main thread,
-   and what the main thread reuses for local per-edit rebuilds. Neighbour lookups span the whole planet
-   via `cells`, so `chunkColumns` is just the columns to EMIT; `cells` is the full grid. */
-export function meshChunkArrays(chunkColumns, cells) {
+   Runs on the MAIN thread for on-demand fine-chunk (re)meshing (streaming activation + per-edit rebuild).
+   Neighbour lookups span the whole planet via the VoxelStore `store`, so `chunkColumns` is just the
+   columns to EMIT; `store` is the full grid. */
+export function meshChunkArrays(chunkColumns, store) {
   const sP = [], sC = [], wP = [], wC = [];
-  for (const col of chunkColumns) emitColumn(col, cells, sP, sC, wP, wC);
+  for (const col of chunkColumns) emitColumn(col, store, sP, sC, wP, wC);
   return {
     sPos: new Float32Array(sP), sCol: new Float32Array(sC),
     wPos: new Float32Array(wP), wCol: new Float32Array(wC),
@@ -289,7 +292,7 @@ const EMPTY_ARRAYS = { sPos: _EMPTY, sCol: _EMPTY, wPos: _EMPTY, wCol: _EMPTY };
    planet doesn't freeze the tab — the caller drives buildNext() across frames behind a progress
    overlay. Returns a manager that also rebuilds individual chunks cheaply when an edit changes only a
    few columns. (Some chunk buckets fall outside their icosa face and stay empty — handled.) */
-export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
+export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
   const groups = Array.from({ length: chunkCount }, () => []);
   for (const col of columns) groups[col.chunk].push(col);
   // Lambert (cheap, diffuse-only) instead of Standard PBR — the non-indexed geometry already
@@ -381,15 +384,15 @@ export function buildPlanetChunks(columns, cells, chunkCount, sunDir) {
       const t0 = performance.now();
       while (next < chunkCount) {
         const e = entries[next++];
-        applyToEntry(e, meshChunkArrays(e.group, cells));
+        applyToEntry(e, meshChunkArrays(e.group, store));
         if (performance.now() - t0 >= timeBudgetMs) break;
       }
       return { done: next >= chunkCount, built: next, total: chunkCount };
     },
-    // mesh / rebuild the given chunk ids (a Set or array) LOCALLY from `cells` — the on-demand
+    // mesh / rebuild the given chunk ids (a Set or array) LOCALLY from the store — the on-demand
     // streaming-activation path and the per-edit path.
     rebuild(chunkIds) {
-      for (const id of chunkIds) applyToEntry(entries[id], meshChunkArrays(entries[id].group, cells));
+      for (const id of chunkIds) applyToEntry(entries[id], meshChunkArrays(entries[id].group, store));
     },
     // unload chunks far from the camera: swap to empty geometry + free GPU memory (E3 streaming)
     unload(chunkIds) {
