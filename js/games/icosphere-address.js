@@ -304,3 +304,44 @@ export function regionColumns(r, f) {
   for (let i = 2; i <= f - 1; i++) for (let j = 1; j <= i - 1; j++) out.push(faceAddr(F, i, j));
   return out;
 }
+
+// ---- sub-region CHUNKING (the stream / generate / mesh unit; chunk count scales with f²) ----
+// A chunk groups a bounded block of a region's columns so PlanetSmith-scale faces (millions of columns)
+// stream in pieces. chunkKey = region*CHUNK_MUL + sub. Pentagon = 1 chunk; edge = length-S segments;
+// face = S×S blocks of the (i,j) lattice. `S` is the cells-per-chunk-side (caller-chosen; ~24).
+export const CHUNK_MUL = 1 << 24;
+export function chunkOf(addr, f, S) {
+  const r = addr.region;
+  if (r < REGION_EDGE) return r * CHUNK_MUL;
+  if (r < REGION_FACE) return r * CHUNK_MUL + Math.floor(addr.local / S);
+  const { i, j } = faceLatticeOfLocal(addr.local), GB = Math.ceil((f + 1) / S);
+  return r * CHUNK_MUL + (Math.floor(i / S) * GB + Math.floor(j / S));
+}
+export function chunkColumns(chunkKey, f, S) {
+  const region = Math.floor(chunkKey / CHUNK_MUL), sub = chunkKey - region * CHUNK_MUL, out = [];
+  if (region < REGION_EDGE) { out.push({ region, local: 0 }); return out; }
+  if (region < REGION_FACE) { const lo = sub * S, hi = Math.min(f - 2, (sub + 1) * S - 1); for (let local = lo; local <= hi; local++) out.push({ region, local }); return out; }
+  const F = region - REGION_FACE, GB = Math.ceil((f + 1) / S), gi = Math.floor(sub / GB), gj = sub - Math.floor(sub / GB) * GB;
+  for (let i = Math.max(2, gi * S); i <= Math.min(f - 1, (gi + 1) * S - 1); i++)
+    for (let j = Math.max(1, gj * S); j <= Math.min(i - 1, (gj + 1) * S - 1); j++) out.push(faceAddr(F, i, j));
+  return out;
+}
+export function chunkCenter(chunkKey, f, S) {
+  const cols = chunkColumns(chunkKey, f, S); if (!cols.length) return null;
+  return centerOf(cols[cols.length >> 1], f);
+}
+// the set of chunk keys whose columns lie within `radiusCols` column-steps of `anchor` (BFS over the column
+// graph). Used by the streamer on chunk-change to pick the active set (no global chunk enumeration needed).
+export function chunksWithin(anchor, f, S, radiusCols) {
+  const start = addressOf(anchor, f), startId = encodeId(start.region, start.local, f);
+  const seen = new Set([startId]); let frontier = [start]; const chunks = new Set([chunkOf(start, f, S)]);
+  for (let d = 0; d < radiusCols; d++) {
+    const next = [];
+    for (const a of frontier) for (const na of neighborsOf(a, f)) {
+      const id = encodeId(na.region, na.local, f);
+      if (!seen.has(id)) { seen.add(id); next.push(na); chunks.add(chunkOf(na, f, S)); }
+    }
+    frontier = next;
+  }
+  return chunks;
+}

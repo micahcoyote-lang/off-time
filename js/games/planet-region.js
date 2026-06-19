@@ -22,7 +22,8 @@
 
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius } from '../../data/planet.js';
 import { makeNoise } from './planet-mesh.js';
-import { regionColumns, regionSize, centerOf, neighborsOf, encodeId, decodeId, columnGeometry, REGION_EDGE } from './icosphere-address.js';
+import { regionColumns, regionSize, centerOf, neighborsOf, encodeId, decodeId, columnGeometry, REGION_EDGE,
+  chunkColumns, chunkOf } from './icosphere-address.js';
 
 const AIR = 0;
 // numeric material ids (rebuilt here to avoid coupling to planet-mesh internals; same order as terrainFill)
@@ -99,13 +100,13 @@ export function fillColumn(cells, base, s, topMat, geo, detail) {
 // structured-id tree hash (same shape as terrainFill's thash, keyed by the STRUCTURED id + seed)
 function thash(seed, i) { let h = Math.imul((seed ^ i) >>> 0, 2246822519); h ^= h >>> 13; h = Math.imul(h, 3266489917); h ^= h >>> 16; return (h >>> 0) / 4294967296; }
 
-/* Generate one region's columns + voxel cells on demand.
-   Returns { region, f, size, columns:[{local,id,center,s,topMat}], neighborIds:Int32Array(size*6),
-             neighborLens:Uint8Array(size), cells:Uint8Array(size*LAYERS) }.
-   `cells` is indexed by local*LAYERS+L (local = the column's index within the region). */
-export function genRegion(region, f, seed) {
+/* Generate an arbitrary set of OWN column addresses + their voxel cells on demand (the shared core of both
+   whole-region and per-chunk generation). `own` = [{region,local}]. Returns
+   { f, size, columns:[{local,id,center,s,topMat}], neighborIds:Int32Array(size*6),
+     neighborLens:Uint8Array(size), cells:Uint8Array(size*LAYERS), idToLocal:Map(id->local) }.
+   `cells` is indexed by local*LAYERS+L (local = the column's index within `own`). */
+export function genColumns(own, f, seed) {
   const fbm = makeNoise(seed);
-  const own = regionColumns(region, f);              // [{region, local}]
   const size = own.length;
   // ---- halo: own columns + 2 rings out (Map id -> node) ----
   const halo = new Map();                             // id -> { addr, center, s, topMat, geo, detail, own, base, nbr:[ids] }
@@ -188,9 +189,14 @@ export function genRegion(region, f, seed) {
   }
 
   const neighborIds = new Int32Array(size * 6).fill(-1), neighborLens = new Uint8Array(size);
-  for (let lc = 0; lc < size; lc++) { const nbr = columns[lc].nbr; neighborLens[lc] = nbr.length; for (let k = 0; k < nbr.length; k++) neighborIds[lc * 6 + k] = nbr[k]; }
-  return { region, f, size, columns: columns.map((n) => ({ local: (n.base / LAYERS) | 0, id: n.id, center: n.center, s: n.s, topMat: n.topMat })), neighborIds, neighborLens, cells };
+  const idToLocal = new Map();
+  for (let lc = 0; lc < size; lc++) { const nbr = columns[lc].nbr; neighborLens[lc] = nbr.length; for (let k = 0; k < nbr.length; k++) neighborIds[lc * 6 + k] = nbr[k]; idToLocal.set(columns[lc].id, lc); }
+  return { f, size, columns: columns.map((n) => ({ local: (n.base / LAYERS) | 0, id: n.id, center: n.center, s: n.s, topMat: n.topMat })), neighborIds, neighborLens, cells, idToLocal };
 }
+
+// whole-region (C2) and per-chunk (C3) generation both delegate to genColumns.
+export function genRegion(region, f, seed) { const d = genColumns(regionColumns(region, f), f, seed); d.region = region; return d; }
+export function genChunk(chunkKey, f, seed, S) { const d = genColumns(chunkColumns(chunkKey, f, S), f, seed); d.chunkKey = chunkKey; return d; }
 
 /* LRU region cache: holds at most `maxRegions` generated regions; evicts least-recently-used. */
 export class RegionCache {
@@ -214,8 +220,7 @@ export class RegionCache {
 /* Store-API adapter over a RegionCache, keyed by STRUCTURED column id (encodeId). Exposes exactly the
    getMat/getTop/getState/setState surface the existing fine-chunk mesher (planet-mesh.js emitColumn /
    meshChunkArrays) expects, so the mesher is reused UNCHANGED — a neighbour lookup `getMat(nbId, L)` for a
-   column in another region transparently generates that region on demand (cross-region seam culling).
-   Edits mutate the cached region's cells in place; persistence (re-applying on regen/evict) is C4. */
+   column in another region transparently generates that region on demand (cross-region seam culling). */
 export class RegionWorld {
   constructor(cache) { this.cache = cache; this.f = cache.f; this.state = new Map(); }
   _at(id) { const { region, local } = decodeId(id, this.f); return { cells: this.cache.get(region).cells, base: local * LAYERS }; }
@@ -226,13 +231,42 @@ export class RegionWorld {
   setState(id, L, v) { const ci = id * LAYERS + L; if (v) this.state.set(ci, v); else this.state.delete(ci); }
 }
 
-/* Build the mesher-ready column objects for a region: {id, center, boundary, neighbors:[structured ids],
-   isPentagon} — geometry reconstructed from the address (no global build). Feed these + a RegionWorld to
-   planet-mesh.js meshChunkArrays to mesh the region (with cross-region neighbour culling). */
-export function regionColumnObjects(region, f) {
-  return regionColumns(region, f).map((addr) => {
+/* Mesher-ready column objects from addresses: {id, center, boundary, neighbors:[structured ids], isPentagon}
+   — geometry reconstructed from the address (no global build). Feed + a RegionWorld/ChunkWorld to
+   meshChunkArrays to mesh with cross-region/chunk neighbour culling. */
+export function columnObjectsFor(addrs, f) {
+  return addrs.map((addr) => {
     const g = columnGeometry(addr, f);
     return { id: encodeId(addr.region, addr.local, f), center: g.center, boundary: g.boundary,
       neighbors: g.neighborAddrs.map((a) => encodeId(a.region, a.local, f)), isPentagon: g.isPentagon };
   });
+}
+export function regionColumnObjects(region, f) { return columnObjectsFor(regionColumns(region, f), f); }
+export function chunkColumnObjects(chunkKey, f, S) { return columnObjectsFor(chunkColumns(chunkKey, f, S), f); }
+
+/* ---- CHUNK-level cache + store (the streaming unit; C3) ---- */
+// LRU cache of generated chunks, keyed by chunkKey. `S` = cells-per-chunk-side (chunk granularity).
+export class ChunkCache {
+  constructor(f, seed, S, maxChunks = 600) { this.f = f; this.seed = seed; this.S = S; this.max = maxChunks; this.map = new Map(); this.tick = 0; }
+  get(chunkKey) {
+    let e = this.map.get(chunkKey);
+    if (e) { e.used = ++this.tick; return e.data; }
+    const data = genChunk(chunkKey, this.f, this.seed, this.S);
+    this.map.set(chunkKey, { data, used: ++this.tick });
+    if (this.map.size > this.max) this._evict();
+    return data;
+  }
+  has(chunkKey) { return this.map.has(chunkKey); }
+  _evict() { let o = null, ok = -1; for (const [k, e] of this.map) if (o === null || e.used < o) { o = e.used; ok = k; } if (ok >= 0) this.map.delete(ok); }
+}
+// Store adapter over a ChunkCache — resolves any structured column id to its owning chunk (generating that
+// chunk on demand). Cross-chunk neighbour lookups during meshing transparently pull in adjacent chunks.
+export class ChunkWorld {
+  constructor(cache) { this.cache = cache; this.f = cache.f; this.S = cache.S; this.state = new Map(); }
+  _at(id) { const addr = decodeId(id, this.f); const data = this.cache.get(chunkOf(addr, this.f, this.S)); return { cells: data.cells, base: data.idToLocal.get(id) * LAYERS }; }
+  getMat(id, L) { const a = this._at(id); return a.cells[a.base + L]; }
+  setMat(id, L, m) { const a = this._at(id); a.cells[a.base + L] = m; }
+  getTop(id) { const a = this._at(id); for (let L = LAYERS - 1; L >= 0; L--) if (a.cells[a.base + L] !== AIR) return L; return -1; }
+  getState(id, L) { return this.state.get(id * LAYERS + L) || 0; }
+  setState(id, L, v) { const ci = id * LAYERS + L; if (v) this.state.set(ci, v); else this.state.delete(ci); }
 }
