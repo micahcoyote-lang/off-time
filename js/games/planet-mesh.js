@@ -14,6 +14,7 @@ import * as THREE from '../../assets/vendor/three.module.js';
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
   WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE,
   SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, SHAPE_STAIRS, ROT_SHIFT, TH } from '../../data/planet.js';
+import { buildTextureAtlas, tileIndex } from './texture-atlas.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -247,10 +248,14 @@ function vertShade(v) {
   h ^= h >>> 13; h = Math.imul(h, 1274126177); h ^= h >>> 15;
   return 0.84 + ((h >>> 0) % 1000) / 1000 * 0.16;          // 0.84 … 1.00
 }
+// per-vertex tile id for the texture atlas, routed via module state so the push helpers' signatures don't
+// change: meshChunkArrays sets _solidCol/_solidTile to the SOLID buffers, emitColumn sets _curTile per cell.
+let _solidCol = null, _solidTile = null, _curTile = 0;
 function pushVert(p, col, positions, colors) {
   const s = vertShade(p);
   positions.push(p.x, p.y, p.z);
   colors.push(col.r * s, col.g * s, col.b * s);
+  if (colors === _solidCol && _solidTile) _solidTile.push(_curTile);   // only solid faces carry a tile
 }
 
 // Orient winding so the face points away from `ref` (the cell's center). This is correct for
@@ -335,6 +340,7 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     if (matn === AIR) continue;
     const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
     const colors = matn === WATER_NUM ? wCol : sCol;
+    _curTile = tileIndex(matn);                                    // texture-atlas tile for this cell's solid faces
     // block shape (Phase 2): full hexel, half-height slab, or a custom mesh block. Water is never shaped.
     const st = (hasStates && matn !== WATER_NUM) ? s.getState(id, L) : 0;
     const shape = st & SHAPE_MASK;
@@ -443,10 +449,12 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
    Neighbour lookups span the whole planet via the VoxelStore `store`, so `chunkColumns` is just the
    columns to EMIT; `store` is the full grid. */
 export function meshChunkArrays(chunkColumns, store) {
-  const sP = [], sC = [], wP = [], wC = [];
+  const sP = [], sC = [], wP = [], wC = [], sT = [];
+  _solidCol = sC; _solidTile = sT;                                 // route per-vertex tile ids onto solid faces
   for (const col of chunkColumns) emitColumn(col, store, sP, sC, wP, wC);
+  _solidCol = _solidTile = null;
   return {
-    sPos: new Float32Array(sP), sCol: new Float32Array(sC),
+    sPos: new Float32Array(sP), sCol: new Float32Array(sC), sTile: new Float32Array(sT),
     wPos: new Float32Array(wP), wCol: new Float32Array(wC),
   };
 }
@@ -485,7 +493,31 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
   // Lambert (cheap, diffuse-only) instead of Standard PBR — the non-indexed geometry already
   // has per-face-constant normals, so it still reads as crisp flat-shaded facets but costs far
   // less per fragment (big win full-screen on integrated GPUs).
+  // Solid terrain: MeshLambert (keeps the built-in sun lighting + shadow receiving) with the vertex colour
+  // as the AO/biome tint, PATCHED via onBeforeCompile to multiply in a TRIPLANAR sample of the grey texture
+  // atlas (per-vertex `tile`). Triplanar (world-space projection) textures hexagonal faces without UVs.
+  const atlas = buildTextureAtlas();
   const solidMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  solidMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uAtlas = { value: atlas.texture };
+    shader.uniforms.uGrid = { value: new THREE.Vector2(atlas.cols, atlas.rows) };
+    shader.uniforms.uTexScale = { value: 4.0 };                  // texture repeats per world unit (tune)
+    shader.vertexShader = 'attribute float tile; varying float vTile; varying vec3 vWPos; varying vec3 vWNrm;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n vTile = tile; vWPos = (modelMatrix * vec4(position,1.0)).xyz; vWNrm = normalize(mat3(modelMatrix) * normal);');
+    shader.fragmentShader = 'uniform sampler2D uAtlas; uniform vec2 uGrid; uniform float uTexScale; varying float vTile; varying vec3 vWPos; varying vec3 vWNrm;\n' + shader.fragmentShader;
+    shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>',
+      `#include <color_fragment>
+       { vec3 an = abs(normalize(vWNrm)); vec3 bw = an / max(an.x + an.y + an.z, 1e-4);
+         vec2 org = vec2(mod(vTile, uGrid.x), floor(vTile / uGrid.x));
+         vec2 ix = clamp(fract(vWPos.zy * uTexScale), 0.03, 0.97);
+         vec2 iy = clamp(fract(vWPos.xz * uTexScale), 0.03, 0.97);
+         vec2 iz = clamp(fract(vWPos.xy * uTexScale), 0.03, 0.97);
+         float d = (texture2D(uAtlas, (org + ix) / uGrid).r * bw.x
+                  + texture2D(uAtlas, (org + iy) / uGrid).r * bw.y
+                  + texture2D(uAtlas, (org + iz) / uGrid).r * bw.z) * 1.28;   // rescale: neutral 200/255 → ~1
+         diffuseColor.rgb *= d; }`);
+  };
 
   // Water is a second, translucent pass with its OWN shader: per-vertex depth tint (vColor) +
   // a gentle radial wave bob + fresnel sheen + a sun-specular glint that tracks the day/night sun.
@@ -554,6 +586,7 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
     const sg = new THREE.BufferGeometry(), wg = new THREE.BufferGeometry();
     sg.setAttribute('position', new THREE.BufferAttribute(a.sPos, 3));
     sg.setAttribute('color', new THREE.BufferAttribute(a.sCol, 3));
+    if (a.sTile) sg.setAttribute('tile', new THREE.BufferAttribute(a.sTile, 1));   // texture-atlas tile per vertex
     wg.setAttribute('position', new THREE.BufferAttribute(a.wPos, 3));
     wg.setAttribute('color', new THREE.BufferAttribute(a.wCol, 3));
     if (a.sPos.length) { sg.computeVertexNormals(); sg.computeBoundingSphere(); }
