@@ -13,7 +13,7 @@
 import * as THREE from '../../assets/vendor/three.module.js';
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
   WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE,
-  SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI } from '../../data/planet.js';
+  SHAPE_FULL, SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI, SHAPE_FENCE, TH } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -313,6 +313,35 @@ function pushTri(p0, p1, p2, col, ref, positions, colors) {
   pushTriC(p0, p1, p2, col, col, col, ref, positions, colors);
 }
 
+// ---- mesh-block geometry (Phase 2): custom shapes baked straight into the chunk buffer (no extra
+// draw calls) — fences, and later stairs/torches. Build in WORLD space: radial = "up", tangential = sideways.
+const _mAx = new THREE.Vector3(), _mUp = new THREE.Vector3(), _mSide = new THREE.Vector3(), _mCtr = new THREE.Vector3();
+const _hw = new THREE.Vector3(), _hu = new THREE.Vector3();
+const _fA = new THREE.Vector3(), _fB = new THREE.Vector3(), _fUp = new THREE.Vector3();   // fence-branch temps (kept clear of emitBar's)
+// a solid box (a "bar") between end-centres a→b, cross-section 2·halfW (horizontal) × 2·halfUp (along `up`)
+function emitBar(a, b, up, halfW, halfUp, col, positions, colors) {
+  _mAx.subVectors(b, a); const len = _mAx.length(); if (len < 1e-6) return; _mAx.multiplyScalar(1 / len);
+  _mUp.copy(up).normalize(); _mSide.crossVectors(_mAx, _mUp); if (_mSide.lengthSq() < 1e-9) return; _mSide.normalize();
+  _hw.copy(_mSide).multiplyScalar(halfW); _hu.copy(_mUp).multiplyScalar(halfUp);
+  const c = [a.clone().sub(_hw).sub(_hu), a.clone().add(_hw).sub(_hu), a.clone().add(_hw).add(_hu), a.clone().sub(_hw).add(_hu),
+    b.clone().sub(_hw).sub(_hu), b.clone().add(_hw).sub(_hu), b.clone().add(_hw).add(_hu), b.clone().sub(_hw).add(_hu)];
+  _mCtr.copy(a).add(b).multiplyScalar(0.5);
+  const q = (i, j, k, l) => { pushTriC(c[i], c[j], c[k], col, col, col, _mCtr, positions, colors); pushTriC(c[i], c[k], c[l], col, col, col, _mCtr, positions, colors); };
+  q(0, 1, 2, 3); q(4, 5, 6, 7); q(0, 1, 5, 4); q(1, 2, 6, 5); q(2, 3, 7, 6); q(3, 0, 4, 7);
+}
+// a tapered hexagonal post at the column centre: footprint = the cell hexagon shrunk toward C (scale sLo
+// at the base, sHi at the top → a slight cap flare), spanning radii [rLo,rHi]. Top cap + side walls.
+function emitPost(C, B, n, rLo, rHi, sLo, sHi, colTop, colSide, positions, colors) {
+  const ring = (r, s) => { const a = new Array(n); for (let k = 0; k < n; k++) a[k] = B[k].clone().sub(C).multiplyScalar(s).add(C).multiplyScalar(r); return a; };
+  const lo = ring(rLo, sLo), hi = ring(rHi, sHi);
+  const ctrTop = C.clone().multiplyScalar(rHi), refMid = C.clone().multiplyScalar((rLo + rHi) / 2);
+  for (let k = 0; k < n; k++) pushTriC(ctrTop, hi[k], hi[(k + 1) % n], colTop, colTop, colTop, refMid, positions, colors);   // top cap
+  for (let k = 0; k < n; k++) { const k2 = (k + 1) % n;                                                                     // side walls
+    pushTriC(lo[k], lo[k2], hi[k2], colSide, colSide, colSide, refMid, positions, colors);
+    pushTriC(lo[k], hi[k2], hi[k], colSide, colSide, colSide, refMid, positions, colors);
+  }
+}
+
 // emit one column's exposed faces; water faces go to the separate (transparent) buffer.
 // Reads material via the VoxelStore (`s`); neighbour lookups span chunks (the store is the whole planet).
 // Bounded by the column's top (air above it emits nothing) so meshing visits ~tens of layers, not 128.
@@ -330,13 +359,36 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
   }
   if (waterTop >= 0) _wcol.copy(WATER_SHALLOW_C).lerp(WATER_DEEP_C, Math.min(1, Math.max(0, waterTop - seabed) / WATER_MAX_DEPTH));
   const hasStates = s.state && s.state.size > 0;                  // skip per-cell state lookups on un-edited worlds
+  // does the block at (cid,cl) cover the TOP of the cell directly below it? full blocks, water and bottom
+  // slabs do; air, top slabs and mesh blocks (fences) don't — so the surface still shows beneath them.
+  const coversBelow = (cid, cl) => { const m = s.getMat(cid, cl); if (m === AIR) return false; if (m === WATER_NUM) return true; const sh = hasStates ? (s.getState(cid, cl) & SHAPE_MASK) : 0; return sh === SHAPE_FULL || sh === SHAPE_SLAB_LO; };
   for (let L = 0; L <= top; L++) {
     const matn = s.getMat(id, L);
     if (matn === AIR) continue;
     const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
     const colors = matn === WATER_NUM ? wCol : sCol;
-    // block shape (Phase 2): full hexel, or a half-height slab. Water is never shaped.
+    // block shape (Phase 2): full hexel, half-height slab, or a custom mesh block. Water is never shaped.
     const shape = (hasStates && matn !== WATER_NUM) ? (s.getState(id, L) & SHAPE_MASK) : 0;
+
+    // FENCE (mesh block): a centre post + rails auto-connecting to each adjacent solid/fence cell.
+    if (shape === SHAPE_FENCE) {
+      const C = col.center, rBase = radius(L), POSTH = 1.5 * TH;
+      _top.copy(COLORS[matn]);                                       // cap colour
+      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);   // post/rail colour
+      emitPost(C, bnd, n, rBase, rBase + POSTH, 0.18, 0.26, _top, _sideC, positions, colors);
+      const rTopRail = rBase + POSTH * 0.84, rMidRail = rBase + POSTH * 0.44;
+      for (let k = 0; k < n; k++) {
+        const nb = neigh[k]; if (nb < 0) continue;
+        const nm = s.getMat(nb, L); if (nm === AIR || nm === WATER_NUM) continue;       // connect to solid / fence neighbours
+        _fUp.copy(bnd[k]).add(bnd[(k + 1) % n]).normalize();                            // edge-midpoint direction (toward nb)
+        for (const rr of [rTopRail, rMidRail]) {
+          _fA.copy(C).multiplyScalar(rr); _fB.copy(_fUp).multiplyScalar(rr);            // post centre → edge midpoint, at this height
+          emitBar(_fA, _fB, C, 0.012, 0.02, _sideC, positions, colors);
+        }
+      }
+      continue;                                                      // a fence cell emits only its mesh, no prism
+    }
+
     const rOutF = radius(L + 1), rInF = radius(L), rMid = (rInF + rOutF) / 2;
     const rHi = shape === SHAPE_SLAB_LO ? rMid : rOutF;            // the band this cell's solid actually fills
     const rLo = shape === SHAPE_SLAB_HI ? rMid : rInF;
@@ -344,7 +396,7 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
 
     // TOP cap (faces up): a full / top-slab cell shows it when the cell above is open; a bottom slab's cap
     // at rMid is always exposed to the air filling the upper half of its cell.
-    const aboveOpen = (L + 1 >= LAYERS) || s.getMat(id, L + 1) === AIR;
+    const aboveOpen = (L + 1 >= LAYERS) || !coversBelow(id, L + 1);
     if (shape === SHAPE_SLAB_LO || aboveOpen) {
       let walled = 0;
       if (shape === 0) for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }

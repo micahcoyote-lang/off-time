@@ -23,7 +23,7 @@ import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfa
 import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS,
-  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI } from '../../data/planet.js';
+  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
@@ -661,9 +661,13 @@ export function mountEarth(task) {
       while (heldGroup.children.length) { const c = heldGroup.children.pop(); c.geometry.dispose(); c.material.dispose(); }
       if (held === 'block') {
         heldGroup.rotation.set(0.55, 0.6, 0);
-        const full = heldShape === SHAPE_FULL, h = full ? 0.13 : 0.065;     // slabs are half-height
-        const yOff = full ? 0 : (heldShape === SHAPE_SLAB_HI ? 0.0325 : -0.0325);
-        heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.1, 0.1, h, 6), MATERIALS[matIdx].color, 0, yOff, 0));   // hexagonal prism (a hexel / slab)
+        if (heldShape === SHAPE_FENCE) {
+          heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.035, 0.05, 0.24, 6), MATERIALS[matIdx].color, 0, 0, 0));   // a fence post
+        } else {
+          const full = heldShape === SHAPE_FULL, h = full ? 0.13 : 0.065;     // slabs are half-height
+          const yOff = full ? 0 : (heldShape === SHAPE_SLAB_HI ? 0.0325 : -0.0325);
+          heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.1, 0.1, h, 6), MATERIALS[matIdx].color, 0, yOff, 0));   // hexagonal prism (a hexel / slab)
+        }
       } else {
         heldGroup.rotation.set(0.35, -0.4, 0.35);          // a "held" tilt; handle runs along local Y
         heldGroup.add(vmBox(0.022, 0.30, 0.022, _vmWood, 0, -0.02, 0));   // handle
