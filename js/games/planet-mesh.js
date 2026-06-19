@@ -370,9 +370,10 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
   }
   if (waterTop >= 0) _wcol.copy(WATER_SHALLOW_C).lerp(WATER_DEEP_C, Math.min(1, Math.max(0, waterTop - seabed) / WATER_MAX_DEPTH));
   const hasStates = s.state && s.state.size > 0;                  // skip per-cell state lookups on un-edited worlds
-  // does the block at (cid,cl) cover the TOP of the cell directly below it? full blocks, water and bottom
-  // slabs do; air, top slabs and mesh blocks (fences) don't — so the surface still shows beneath them.
-  const coversBelow = (cid, cl) => { const m = s.getMat(cid, cl); if (m === AIR) return false; if (m === WATER_NUM) return true; const sh = hasStates ? (s.getState(cid, cl) & SHAPE_MASK) : 0; return sh === SHAPE_FULL || sh === SHAPE_SLAB_LO; };
+  // does the block at (cid,cl) OPAQUELY cover the TOP of the cell directly below it? full blocks and bottom
+  // slabs do; air, WATER (transparent), top slabs and mesh blocks (fences) don't — so the surface shows
+  // beneath them. Water being non-covering is what lets the SEABED render through clear water (no see-through).
+  const coversBelow = (cid, cl) => { const m = s.getMat(cid, cl); if (m === AIR || m === WATER_NUM) return false; const sh = hasStates ? (s.getState(cid, cl) & SHAPE_MASK) : 0; return sh === SHAPE_FULL || sh === SHAPE_SLAB_LO; };
   for (let L = 0; L <= top; L++) {
     const matn = s.getMat(id, L);
     if (matn === AIR) continue;
@@ -440,11 +441,14 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     _ref.copy(col.center).multiplyScalar((rLo + rHi) / 2);         // ref at the band mid → side-wall winding
 
     // TOP cap (faces up): a full / top-slab cell shows it when the cell above is open; a bottom slab's cap
-    // at rMid is always exposed to the air filling the upper half of its cell.
-    const aboveOpen = (L + 1 >= LAYERS) || !coversBelow(id, L + 1);
+    // at rMid is always exposed. A WATER cell only emits its top at the SURFACE (air above) — never between
+    // submerged layers; a SOLID cell shows its top unless OPAQUELY covered (so the seabed shows under water).
+    const aboveOpen = matn === WATER_NUM
+      ? (L + 1 >= LAYERS || s.getMat(id, L + 1) === AIR)
+      : (L + 1 >= LAYERS || !coversBelow(id, L + 1));
     if (shape === SHAPE_SLAB_LO || aboveOpen) {
-      let walled = 0;
-      if (shape === 0) for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }
+      let walled = 0;   // AO: count neighbours that rise above this cell (water doesn't wall — keeps seabeds bright)
+      if (shape === 0) for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS) { const mn = s.getMat(nb, L + 1); if (mn !== AIR && mn !== WATER_NUM) walled++; } }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
       if (matn === WATER_NUM) _top.copy(_wcol);                         // pure depth tint → shader recovers depth for its alpha
       else _top.copy(COLORS[matn]).multiplyScalar(aoTop);
