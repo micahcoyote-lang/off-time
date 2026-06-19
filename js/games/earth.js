@@ -30,7 +30,7 @@ const PHI_MIN = 0.15, PHI_MAX = Math.PI - 0.15;
 const FLY_ALT_MIN = 0.8, FLY_ALT_MAX = R * 1.6;      // altitude ABOVE the local surface (not the core)
 // ---- walk mode (first-person on the surface, radial gravity) ----
 const EYE = 0.45;             // eye height above the ground (world units)
-const WALK_SPEED = 1.8 / R;   // ~1.8 world-units/s along the surface (angular = linear/R, so a bigger planet takes proportionally longer to cross)
+const WALK_SPEED = 0.95 / R;   // ~0.95 world-units/s along the surface (angular = linear/R; tuned to a natural walking pace)
 const GRAV = 9, JUMP_V = 2.4; // radial gravity / jump (world units/s)
 const STEP_UP = TH * 1.4;     // auto-step up to ~1 hexel; taller = wall (blocks)
 const STEP_LAYERS = Math.max(1, Math.round(STEP_UP / TH));   // step-up ceiling in layers, for the floor scan
@@ -512,19 +512,20 @@ export function mountEarth(task) {
       if (window.__earthDebug) { window.__earthDebug.activeChunks = activeSet.size; window.__earthDebug.fineTris = planet.triCount; }
     }
 
-    // ---- highlight outline (always on target) + place ghost (Place tool only) ----
-    const hiMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7, depthTest: false });
-    const hiGeo = new THREE.BufferGeometry();
-    hiGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(6 * 3), 3));
-    const highlight = new THREE.LineLoop(hiGeo, hiMat);
-    highlight.renderOrder = 2; highlight.visible = false; highlight.frustumCulled = false;
-    scene.add(highlight);
+    // ---- selection wireframe (black hexel-prism outline, PlanetSmith-style) + breaking crack overlay ----
+    // selBox outlines the place cell (holding a block) OR the mine target (holding a tool); always black.
+    const selMat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.85, depthTest: false });
+    const selGeo = new THREE.BufferGeometry();
+    const selBox = new THREE.LineSegments(selGeo, selMat);
+    selBox.renderOrder = 3; selBox.visible = false; selBox.frustumCulled = false;
+    scene.add(selBox);
 
-    const ghostMat = new THREE.MeshBasicMaterial({ color: 0x4ade80, transparent: true, opacity: 0.45, depthWrite: false, side: THREE.DoubleSide });
-    const ghostGeo = new THREE.BufferGeometry();
-    const ghost = new THREE.Mesh(ghostGeo, ghostMat);
-    ghost.visible = false; ghost.frustumCulled = false;
-    scene.add(ghost);
+    // crack = a black translucent prism over the block being mined; opacity ramps with hits/needed.
+    const crackMat = new THREE.MeshBasicMaterial({ color: 0x050505, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
+    const crackGeo = new THREE.BufferGeometry();
+    const crack = new THREE.Mesh(crackGeo, crackMat);
+    crack.visible = false; crack.frustumCulled = false; crack.renderOrder = 2;
+    scene.add(crack);
 
     // ---- creative state: you HOLD a block (place) or a tool (pickaxe/shovel/axe, gated mine) ----
     let held = 'block';                                   // 'block' | 'pickaxe' | 'shovel' | 'axe'
@@ -538,6 +539,8 @@ export function mountEarth(task) {
       axe: _ids('wood', 'leaves', 'pineleaf'),
     };
     const TOOL_META = { pickaxe: { emoji: '⛏️', title: 'Pickaxe' }, shovel: { emoji: '🪏', title: 'Shovel' }, axe: { emoji: '🪓', title: 'Axe' } };
+    const HITS = { pickaxe: 5, axe: 3, shovel: 2 };           // hits to break, by hardness category (rock/wood/soil)
+    let breaking = null;                                      // { colId, L, hits } — accumulates while you dig one cell
     const toolForMat = (m) => { for (const t in TOOLSET) if (TOOLSET[t].has(m)) return t; return 'pickaxe'; };
     let target = null;                                    // { colId, L, placeColId, placeL } from raycastVoxel
     let needsTarget = true;                               // recompute target this frame (set on edit)
@@ -573,7 +576,11 @@ export function mountEarth(task) {
       if (held === 'block' || !TOOLSET[held].has(m)) {     // wrong tool → hint, no dig
         const need = TOOL_META[toolForMat(m)]; showHint(`Need a ${need.emoji} ${need.title}`); return;
       }
-      applyEdit(target.colId, target.L, AIR);
+      // multi-hit breaking: same cell + tool accumulates hits; a new target resets the count.
+      if (!breaking || breaking.colId !== target.colId || breaking.L !== target.L) breaking = { colId: target.colId, L: target.L, hits: 0 };
+      breaking.hits++;
+      if (breaking.hits >= (HITS[held] || 4)) { applyEdit(target.colId, target.L, AIR); breaking = null; }
+      else needsTarget = true;                             // re-run targeting so the crack overlay deepens
     }
     let hintTimer = 0;
     function showHint(text) { hint.textContent = text; hint.classList.remove('hidden'); clearTimeout(hintTimer); hintTimer = setTimeout(() => hint.classList.add('hidden'), 1200); }
@@ -583,16 +590,15 @@ export function mountEarth(task) {
     heldGroup.position.set(0.16, -0.13, -0.40);            // camera-space: lower-right, just in front (clears the belt)
     scene.add(camera); camera.add(heldGroup);              // camera must be in the scene graph for its children to render
     const _vmHead = 0x6b7079, _vmWood = 0x8a5a37;
-    const vmBox = (w, h, d, hex, x, y, z) => {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
-        new THREE.MeshLambertMaterial({ color: hex, emissive: new THREE.Color(hex).multiplyScalar(0.35), depthTest: false }));
-      m.position.set(x, y, z); m.renderOrder = 999; m.frustumCulled = false; return m;
-    };
+    const vmLambert = (hex) => new THREE.MeshLambertMaterial({ color: hex, emissive: new THREE.Color(hex).multiplyScalar(0.35), depthTest: false });
+    const vmMesh = (geo, hex, x, y, z) => { const m = new THREE.Mesh(geo, vmLambert(hex)); m.position.set(x, y, z); m.renderOrder = 999; m.frustumCulled = false; return m; };
+    const vmBox = (w, h, d, hex, x, y, z) => vmMesh(new THREE.BoxGeometry(w, h, d), hex, x, y, z);
     function updateHeldModel() {
       while (heldGroup.children.length) { const c = heldGroup.children.pop(); c.geometry.dispose(); c.material.dispose(); }
       if (held === 'block') {
-        heldGroup.rotation.set(0.5, 0.6, 0);
-        heldGroup.add(vmBox(0.12, 0.12, 0.12, MATERIALS[matIdx].color, 0, 0, 0));
+        heldGroup.rotation.set(0.55, 0.6, 0);
+        const hx = vmMesh(new THREE.CylinderGeometry(0.1, 0.1, 0.13, 6), MATERIALS[matIdx].color, 0, 0, 0);   // a hexagonal prism (a hexel)
+        heldGroup.add(hx);
       } else {
         heldGroup.rotation.set(0.35, -0.4, 0.35);          // a "held" tilt; handle runs along local Y
         heldGroup.add(vmBox(0.022, 0.30, 0.022, _vmWood, 0, -0.02, 0));   // handle
@@ -867,39 +873,36 @@ export function mountEarth(task) {
       return null;
     }
 
-    let lastTargetKey = '', lastGhostKey = '';
+    let lastSelKey = '', crackKey = '';
     function updateTargeting() {
       target = raycastVoxel();
       debugTarget();
-      // highlight outlines the hit (mine) cell
-      const tkey = target ? `${target.colId},${target.L}` : '';
-      if (tkey !== lastTargetKey) {
-        lastTargetKey = tkey;
-        if (!target) highlight.visible = false;
+      // a partially-broken block "heals" once you stop aiming at it
+      if (breaking && (!target || breaking.colId !== target.colId || breaking.L !== target.L)) breaking = null;
+
+      // black wireframe box: the place cell when holding a block, the mine target when holding a tool
+      let selCol = -1, selL = -1;
+      if (target) {
+        if (held === 'block') { if (target.placeColId >= 0) { selCol = target.placeColId; selL = target.placeL; } }
+        else { selCol = target.colId; selL = target.L; }
+      }
+      const skey = selCol < 0 ? '' : `${selCol},${selL}`;
+      if (skey !== lastSelKey) {
+        lastSelKey = skey;
+        if (selCol < 0) selBox.visible = false;
         else {
-          const col = columns[target.colId], r = radius(target.L + 1) + 0.02;
-          const arr = hiGeo.attributes.position.array, n = col.boundary.length;
-          for (let k = 0; k < 6; k++) {
-            const v = col.boundary[k % n];                  // pentagons reuse a vert to fill the 6-slot buffer
-            arr[k * 3] = v.x * r; arr[k * 3 + 1] = v.y * r; arr[k * 3 + 2] = v.z * r;
-          }
-          hiGeo.setDrawRange(0, n);
-          hiGeo.attributes.position.needsUpdate = true;
-          highlight.visible = true;
+          selGeo.setAttribute('position', new THREE.Float32BufferAttribute(hexelWire(columns[selCol], selL), 3));
+          selBox.visible = true;
         }
       }
-      if (target) hiMat.color.setHex(held !== 'block' ? 0xfca5a5 : 0xffffff);
 
-      // ghost previews the place cell (the air cell the ray last passed through) — only when holding a block
-      if (held !== 'block' || !target || target.placeColId < 0) { ghost.visible = false; lastGhostKey = ''; return; }
-      const valid = store.getMat(target.placeColId, target.placeL) === AIR;
-      ghostMat.color.setHex(valid ? 0x4ade80 : 0xf87171);
-      const gkey = `${target.placeColId},${target.placeL}`;
-      if (gkey !== lastGhostKey) {
-        lastGhostKey = gkey;
-        ghostGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(columns[target.placeColId], target.placeL), 3));
-      }
-      ghost.visible = true;
+      // crack overlay: darkens the block being mined as hits accumulate
+      if (breaking && target && breaking.colId === target.colId && breaking.L === target.L) {
+        crackMat.opacity = 0.15 + 0.6 * Math.min(1, breaking.hits / (HITS[held] || 4));
+        const ck = `${breaking.colId},${breaking.L}`;
+        if (ck !== crackKey) { crackKey = ck; crackGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(columns[breaking.colId], breaking.L), 3)); }
+        crack.visible = true;
+      } else { crack.visible = false; crackKey = ''; }
     }
     const debugTarget = () => (window.__earthDebug ? (window.__earthDebug.target = target && { c: target.colId, L: target.L, pc: target.placeColId, pL: target.placeL }) : 0);
 
@@ -1102,8 +1105,8 @@ export function mountEarth(task) {
       if (worker) { worker.terminate(); worker = null; }
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();
       if (planet) { planet.meshes.forEach((m) => scene.remove(m)); planet.dispose(); }
-      scene.remove(highlight); hiGeo.dispose(); hiMat.dispose();
-      scene.remove(ghost); ghostGeo.dispose(); ghostMat.dispose();
+      scene.remove(selBox); selGeo.dispose(); selMat.dispose();
+      scene.remove(crack); crackGeo.dispose(); crackMat.dispose();
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
       for (const b of beacons) { scene.remove(b); b.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); }); }
@@ -1132,7 +1135,19 @@ export function mountEarth(task) {
   };
 }
 
-/* positions for a single hexel prism (top fan + side walls), used by the place ghost */
+/* line-segment positions for a single hexel prism's edges: top hex + bottom hex + 6 verticals (the black selection box) */
+function hexelWire(col, L) {
+  const rOut = radius(L + 1), rIn = radius(L), b = col.boundary, n = b.length, pos = [];
+  for (let k = 0; k < n; k++) {
+    const a = b[k], c = b[(k + 1) % n];
+    pos.push(a.x * rOut, a.y * rOut, a.z * rOut, c.x * rOut, c.y * rOut, c.z * rOut);   // top edge
+    pos.push(a.x * rIn, a.y * rIn, a.z * rIn, c.x * rIn, c.y * rIn, c.z * rIn);          // bottom edge
+    pos.push(a.x * rOut, a.y * rOut, a.z * rOut, a.x * rIn, a.y * rIn, a.z * rIn);       // vertical
+  }
+  return pos;
+}
+
+/* positions for a single hexel prism (top fan + side walls), used by the crack overlay */
 function cellPrism(col, L) {
   const rOut = radius(L + 1), rIn = radius(L), b = col.boundary, n = b.length, pos = [];
   const ctr = col.center.clone().multiplyScalar(rOut);
