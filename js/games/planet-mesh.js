@@ -235,7 +235,8 @@ export function terrainFill(columns, seed) {
 const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _nrm = new THREE.Vector3(), _out = new THREE.Vector3();
 const _ref = new THREE.Vector3(), _capRef = new THREE.Vector3();
 const _top = new THREE.Color(), _sideC = new THREE.Color(), _sideBot = new THREE.Color();
-const GRASS_NUM = NUM.grass, WATER_NUM = NUM.water, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
+const GRASS_NUM = NUM.grass, WATER_NUM = NUM.water;
+const DIRT_TILE = tileIndex(NUM.dirt);   // v38 full-colour: grass SIDE faces sample the dirt tile (colour is in the atlas now)
 const WALL_BASE_AO = 0.7;                                   // wall bottoms this fraction as bright as tops
 const WATER_SHALLOW_C = new THREE.Color(WATER_SHALLOW), WATER_DEEP_C = new THREE.Color(WATER_DEEP);
 const _wcol = new THREE.Color();                            // per-column depth-graded water tint
@@ -350,7 +351,8 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
       const rot = (st >> ROT_SHIFT) & 7, rIn = radius(L), rOut = radius(L + 1), rMid = (rIn + rOut) / 2, o = (rot + (n >> 1)) % n;
       _fUp.copy(bnd[rot % n]).add(bnd[(rot + 1) % n]).normalize(); _fA.copy(_fUp).multiplyScalar(rMid);       // one end (edge `rot`)
       _fUp.copy(bnd[o]).add(bnd[(o + 1) % n]).normalize(); _fB.copy(_fUp).multiplyScalar(rMid);               // other end (opposite edge)
-      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]);
+      if (matn === GRASS_NUM) _curTile = DIRT_TILE;
+      _sideC.setScalar(0.9);                                            // v38: AO-grey; colour from the atlas tile
       emitBar(_fA, _fB, col.center, 0.018, (rOut - rIn) / 2, _sideC, positions, colors);
       continue;
     }
@@ -358,7 +360,8 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     // STAIRS (oriented mesh block): a full bottom slab + the 3 back sectors raised to a top step + riser.
     if (shape === SHAPE_STAIRS) {
       const rot = (st >> ROT_SHIFT) & 7, rIn = radius(L), rOut = radius(L + 1), rMid = (rIn + rOut) / 2, C = col.center;
-      _top.copy(COLORS[matn]); _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
+      if (matn === GRASS_NUM) _curTile = DIRT_TILE;                     // v38: AO-grey; colour from the atlas tile
+      _top.setScalar(1.0); _sideC.setScalar(0.82);
       emitHexBand(C, bnd, n, rIn, rMid, _top, _sideC, positions, colors);                  // bottom slab (full)
       const refUp = C.clone().multiplyScalar((rMid + rOut) / 2);
       _fUp.copy(bnd[rot % n]).add(bnd[(rot + 1) % n]).normalize();                          // facing direction
@@ -381,8 +384,9 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     // FENCE (mesh block): a centre post + rails auto-connecting to each adjacent solid/fence cell.
     if (shape === SHAPE_FENCE) {
       const C = col.center, rBase = radius(L), POSTH = 1.5 * TH;
-      _top.copy(COLORS[matn]);                                       // cap colour
-      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);   // post/rail colour
+      if (matn === GRASS_NUM) _curTile = DIRT_TILE;                  // v38: AO-grey; colour from the atlas tile
+      _top.setScalar(1.0);                                          // cap shade
+      _sideC.setScalar(0.82);                                       // post/rail shade
       emitPost(C, bnd, n, rBase, rBase + POSTH, 0.18, 0.26, _top, _sideC, positions, colors);
       const rTopRail = rBase + POSTH * 0.84, rMidRail = rBase + POSTH * 0.44;
       for (let k = 0; k < n; k++) {
@@ -413,14 +417,14 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
       if (shape === 0) for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS) { const mn = s.getMat(nb, L + 1); if (mn !== AIR && mn !== WATER_NUM) walled++; } }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
       if (matn === WATER_NUM) _top.copy(_wcol);                         // pure depth tint → shader recovers depth for its alpha
-      else _top.copy(COLORS[matn]).multiplyScalar(aoTop);
+      else _top.setScalar(aoTop);                                       // v38: AO-grey; colour comes from the atlas (uTile)
       const ctr = col.center.clone().multiplyScalar(rHi);
       for (let k = 0; k < n; k++)
         pushTri(ctr, bnd[k].clone().multiplyScalar(rHi), bnd[(k + 1) % n].clone().multiplyScalar(rHi), _top, _ref, positions, colors);
     }
     // BOTTOM cap (faces down): a top slab floats over the cell's lower-half gap, so show its underside.
     if (shape === SHAPE_SLAB_HI) {
-      _top.copy(COLORS[matn]).multiplyScalar(WALL_BASE_AO);
+      _top.setScalar(WALL_BASE_AO);                                     // v38: AO-grey underside
       const ctr = col.center.clone().multiplyScalar(rLo);
       _capRef.copy(col.center).multiplyScalar(rHi);                     // ref ABOVE the cap → normal points down
       for (let k = 0; k < n; k++)
@@ -429,9 +433,10 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     // SIDE walls over the occupied band. grass shows brown (dirt) sides; water stays PURE depth tint
     // (no AO/gradient) so the shader can recover depth for its alpha.
     if (matn === WATER_NUM) { _sideC.copy(_wcol); _sideBot.copy(_wcol); }
-    else {
-      _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
-      _sideBot.copy(_sideC).multiplyScalar(WALL_BASE_AO);
+    else {                                                              // v38: AO-grey side gradient; grass samples the dirt tile
+      if (matn === GRASS_NUM) _curTile = DIRT_TILE;
+      _sideC.setScalar(0.82);
+      _sideBot.setScalar(0.82 * WALL_BASE_AO);
     }
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
@@ -494,8 +499,8 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
   // has per-face-constant normals, so it still reads as crisp flat-shaded facets but costs far
   // less per fragment (big win full-screen on integrated GPUs).
   // Solid terrain: MeshLambert (keeps the built-in sun lighting + shadow receiving) with the vertex colour
-  // as the AO/biome tint, PATCHED via onBeforeCompile to multiply in a TRIPLANAR sample of the grey texture
-  // atlas (per-vertex `tile`). Triplanar (world-space projection) textures hexagonal faces without UVs.
+  // as pure AO/shade grey, PATCHED via onBeforeCompile to multiply in a TRIPLANAR sample of the full-COLOUR
+  // texture atlas (per-vertex `tile`). Triplanar (world-space projection) textures hexagonal faces without UVs.
   const atlas = buildTextureAtlas();
   const solidMat = new THREE.MeshLambertMaterial({ vertexColors: true });
   solidMat.onBeforeCompile = (shader) => {
@@ -513,9 +518,9 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
          vec2 ix = clamp(fract(vWPos.zy * uTexScale), 0.03, 0.97);
          vec2 iy = clamp(fract(vWPos.xz * uTexScale), 0.03, 0.97);
          vec2 iz = clamp(fract(vWPos.xy * uTexScale), 0.03, 0.97);
-         float d = (texture2D(uAtlas, (org + ix) / uGrid).r * bw.x
-                  + texture2D(uAtlas, (org + iy) / uGrid).r * bw.y
-                  + texture2D(uAtlas, (org + iz) / uGrid).r * bw.z) * 1.28;   // rescale: neutral 200/255 → ~1
+         vec3 d = texture2D(uAtlas, (org + ix) / uGrid).rgb * bw.x      // v38: full-COLOUR triplanar atlas sample
+                + texture2D(uAtlas, (org + iy) / uGrid).rgb * bw.y      // (atlas carries colour; vertex carries AO-grey)
+                + texture2D(uAtlas, (org + iz) / uGrid).rgb * bw.z;
          diffuseColor.rgb *= d; }`);
   };
 

@@ -42,11 +42,14 @@ function styleOf(id) {
   return 'mottle';   // stone/rock/dirt/granite/basalt/slate/redrock/scree/core/snow/water/…
 }
 
-// draw one material's tile at canvas (px,py). Output is GREY DETAIL (luminance ~1.0 = no change) — the
-// chunk shader MULTIPLIES it onto the already color/AO-tuned vertex color, so this is per-material texture
-// detail (planks/brick/speckle), not base colour. NEUTRAL = 200/255 (shader rescales ×1.28 so f≈1 → ×1).
+// draw one material's tile at canvas (px,py). Output is the material's BASE COLOUR modulated by a per-style
+// detail factor `f` (planks/brick/speckle ≈ 0.6…1.1) — the chunk shader MULTIPLIES this colour triplanar-ly
+// onto a vertex carrying only AO/shade grey, so the atlas now CARRIES the colour (full-colour textures, v38).
+// mat.color is an sRGB hex; we write its raw bytes (sRGB) and tag the texture SRGBColorSpace so the sampled
+// linear value matches the old THREE.Color(mat.color) vertex tint → same brightness, now with texture detail.
 function drawTile(ctx, px, py, t, mat) {
   const style = styleOf(mat.id), img = ctx.createImageData(TILE, TILE), d = img.data;
+  const cr = (mat.color >> 16) & 255, cg = (mat.color >> 8) & 255, cb = mat.color & 255;
   for (let y = 0; y < TILE; y++) {
     for (let x = 0; x < TILE; x++) {
       let f = 0.88 + h01(t, x, y) * 0.24;          // base per-pixel speckle
@@ -65,8 +68,8 @@ function drawTile(ctx, px, py, t, mat) {
         f = 0.97 + h01(t, x, y) * 0.06;
         f += Math.max(0, 1 - Math.abs(((x + y) % TILE) - TILE * 0.4) / 6) * 0.12;
       }
-      const g = clamp255(f * 200), i = (y * TILE + x) * 4;       // 200 = neutral (shader rescales)
-      d[i] = g; d[i + 1] = g; d[i + 2] = g; d[i + 3] = 255;
+      const i = (y * TILE + x) * 4;                              // base colour × detail factor f
+      d[i] = clamp255(cr * f); d[i + 1] = clamp255(cg * f); d[i + 2] = clamp255(cb * f); d[i + 3] = 255;
     }
   }
   ctx.putImageData(img, px, py);
@@ -84,7 +87,7 @@ export function buildTextureAtlas() {
   }
   const tex = new THREE.CanvasTexture(cv);
   tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestMipmapLinearFilter;
-  tex.generateMipmaps = true; tex.colorSpace = THREE.NoColorSpace; tex.anisotropy = 4;   // detail multiplier, not colour
+  tex.generateMipmaps = true; tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;   // carries base colour (v38)
   tex.flipY = false;   // shader maps tile (col,row) directly to UV → canvas-top must be v=0 (no flip)
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   _atlas = { texture: tex, canvas: cv, cols: COLS, rows: ROWS, tile: TILE, width: ATLAS_W, height: ATLAS_H };
