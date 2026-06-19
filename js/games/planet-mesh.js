@@ -422,8 +422,12 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
       for (let k = 0; k < n; k++)
         pushTri(ctr, bnd[k].clone().multiplyScalar(rHi), bnd[(k + 1) % n].clone().multiplyScalar(rHi), _top, _ref, positions, colors);
     }
-    // BOTTOM cap (faces down): a top slab floats over the cell's lower-half gap, so show its underside.
-    if (shape === SHAPE_SLAB_HI) {
+    // BOTTOM cap (faces down): a top slab floats over its lower-half gap; ALSO any solid cell whose cell
+    // BELOW is open (air or transparent water) shows its underside — so canopy/overhang/floating-block
+    // undersides aren't see-through when you look up from beneath.
+    let belowOpen = false;
+    if (matn !== WATER_NUM && L > 0) { const mb = s.getMat(id, L - 1); belowOpen = (mb === AIR || mb === WATER_NUM); }
+    if (shape === SHAPE_SLAB_HI || belowOpen) {
       _top.setScalar(WALL_BASE_AO);                                     // v38: AO-grey underside
       const ctr = col.center.clone().multiplyScalar(rLo);
       _capRef.copy(col.center).multiplyScalar(rHi);                     // ref ABOVE the cap → normal points down
@@ -440,7 +444,10 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     }
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
-      if (!(nb < 0 || s.getMat(nb, L) === AIR)) continue;
+      const nm = nb < 0 ? AIR : s.getMat(nb, L);
+      // draw the wall toward air; a SOLID cell ALSO walls toward WATER so the bank/shore renders (opaque,
+      // "like the bottom") through the clear water instead of showing a see-through edge.
+      if (nm !== AIR && !(matn !== WATER_NUM && nm === WATER_NUM)) continue;
       const aOut = bnd[k].clone().multiplyScalar(rHi), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rHi);
       const aIn = bnd[k].clone().multiplyScalar(rLo), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rLo);
       pushTriC(aOut, bOut, bIn, _sideC, _sideC, _sideBot, _ref, positions, colors);   // top verts bright, bottom dark
