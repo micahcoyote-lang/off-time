@@ -443,6 +443,14 @@ body.earth-wide #app { max-width: none; }
 }
 .earth-matpanel .mat-btn.active { border-color: #fff; background: rgba(255,255,255,0.2); }
 
+/* transient "need a pickaxe" hint toast, just under the crosshair */
+.earth-hint {
+  position: absolute; top: 56%; left: 50%; transform: translateX(-50%); z-index: 3; pointer-events: none;
+  background: rgba(120,30,30,0.82); color: #ffe2e2; font-weight: 700; font-size: 0.92rem;
+  padding: 6px 14px; border-radius: 999px; white-space: nowrap;
+}
+.earth-hint.hidden { display: none; }
+
 .earth-loading {
   position: absolute; inset: 0; z-index: 4;
   display: flex; align-items: center; justify-content: center;

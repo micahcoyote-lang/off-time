@@ -11,9 +11,9 @@
    - camera limits derive from MAX_R so near-cubic terrain never clips;
    - generation runs behind a brief loading overlay so the UI paints first.
 
-   Controls — W/A/S/D move · Q/E zoom (orbit) / altitude (fly) · G land/fly toggle ·
-   F place · R mine · C/V material · 1/2 Place/Mine tool · H help. (Mouse: drag look, wheel
-   zoom, click = active tool.) */
+   Controls — spawn walking; click to look · W/A/S/D move · Space jump · X walk⇄hover (Q/E altitude) ·
+   1 block / 2 pickaxe / 3 shovel / 4 axe (gated mine) · click/F/R use held · B materials · C/V cycle ·
+   M map · H help. */
 
 import * as THREE from '../../assets/vendor/three.module.js';
 import { el, topbar, go } from '../ui.js';
@@ -50,15 +50,16 @@ export function mountEarth(task) {
   const legend = el('div.earth-legend');
   legend.innerHTML =
     '<b>Controls</b><br>Click — look around<br>W A S D — walk · Space — jump<br>' +
-    'X — hover (fly) · Q / E — up / down<br>F — place · R — mine<br>' +
-    'B / C / V — materials<br>1 / 2 — Place / Mine<br>M — world map<br>H — hide this';
+    'X — hover (fly) · Q / E — up / down<br>Click / F / R — use held item<br>' +
+    '1 block · 2 ⛏️ · 3 🪏 · 4 🪓<br>B — materials · C / V — cycle<br>M — world map · H — hide this';
   const overlay = el('div.earth-loading', { text: 'Generating planet…' });
   const mapEl = el('div.earth-map.hidden', {
     html: '<div class="earth-map-frame"><div class="earth-map-title">World Map · drag to spin · M / Esc to close</div></div>',
   });
   const mapFrame = mapEl.querySelector('.earth-map-frame');
   const matPanel = el('div.earth-matpanel.hidden');                // material picker (built in refreshBelt)
-  stage.append(view, hud, reticle, belt, legend, overlay, mapEl, matPanel);
+  const hint = el('div.earth-hint.hidden');                        // transient "need a pickaxe" toast
+  stage.append(view, hud, reticle, belt, legend, overlay, mapEl, matPanel, hint);
   screen.append(stage);
 
   // Deferred build: paint the overlay first, then do the heavy generation one tick later.
@@ -441,10 +442,19 @@ export function mountEarth(task) {
     ghost.visible = false; ghost.frustumCulled = false;
     scene.add(ghost);
 
-    // ---- creative state ----
-    let tool = 'place';                                   // 'place' | 'mine'
+    // ---- creative state: you HOLD a block (place) or a tool (pickaxe/shovel/axe, gated mine) ----
+    let held = 'block';                                   // 'block' | 'pickaxe' | 'shovel' | 'axe'
     let matIdx = MATERIALS.findIndex((m) => m.id === 'grass'); if (matIdx < 0) matIdx = 0;
     const matNum = () => matIdx + 1;                       // numeric id (0 = air)
+    // which materials each tool can mine (water is never mineable). Names → numeric ids via MATERIAL_NUM.
+    const _ids = (...names) => new Set(names.map((n) => MATERIAL_NUM[n]).filter(Boolean));
+    const TOOLSET = {
+      pickaxe: _ids('stone', 'rock', 'granite', 'basalt', 'slate', 'sandstone', 'redrock', 'core', 'ice', 'brick', 'glass', 'gold'),
+      shovel: _ids('dirt', 'sand', 'snow', 'grass', 'savanna', 'tundra', 'forest', 'jungle', 'taiga', 'scree'),
+      axe: _ids('wood', 'leaves', 'pineleaf'),
+    };
+    const TOOL_META = { pickaxe: { emoji: '⛏️', title: 'Pickaxe' }, shovel: { emoji: '🪏', title: 'Shovel' }, axe: { emoji: '🪓', title: 'Axe' } };
+    const toolForMat = (m) => { for (const t in TOOLSET) if (TOOLSET[t].has(m)) return t; return 'pickaxe'; };
     let target = null;                                    // { colId, L, placeColId, placeL } from raycastVoxel
     let needsTarget = true;                               // recompute target this frame (set on edit)
     let shadowDirty = true, shadowAcc = 0;                // refresh shadow map on edits + a few times/sec
@@ -465,40 +475,71 @@ export function mountEarth(task) {
       needsTarget = true; shadowDirty = true;             // surface height changed under the crosshair
       persist(); markTaskDone('earth'); drawHud();
     }
+    // left-click / F / R "use" the held item: a block places, a tool mines (if it matches the material)
+    function doUse() { if (held === 'block') doPlace(); else doMine(); }
     function doPlace() {
-      tool = 'place';
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
       if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
       applyEdit(target.placeColId, target.placeL, matNum());
     }
     function doMine() {
-      tool = 'mine';
       if (!target) return;
       const m = store.getMat(target.colId, target.L);
       if (m === AIR || m === WATER) return;                // water is a liquid — not mineable
+      if (held === 'block' || !TOOLSET[held].has(m)) {     // wrong tool → hint, no dig
+        const need = TOOL_META[toolForMat(m)]; showHint(`Need a ${need.emoji} ${need.title}`); return;
+      }
       applyEdit(target.colId, target.L, AIR);
     }
+    let hintTimer = 0;
+    function showHint(text) { hint.textContent = text; hint.classList.remove('hidden'); clearTimeout(hintTimer); hintTimer = setTimeout(() => hint.classList.add('hidden'), 1200); }
+
+    // ---- first-person held-item viewmodel: a small mesh in the lower-right, like an FPS hand ----
+    const heldGroup = new THREE.Group();
+    heldGroup.position.set(0.16, -0.13, -0.40);            // camera-space: lower-right, just in front (clears the belt)
+    scene.add(camera); camera.add(heldGroup);              // camera must be in the scene graph for its children to render
+    const _vmHead = 0x6b7079, _vmWood = 0x8a5a37;
+    const vmBox = (w, h, d, hex, x, y, z) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+        new THREE.MeshLambertMaterial({ color: hex, emissive: new THREE.Color(hex).multiplyScalar(0.35), depthTest: false }));
+      m.position.set(x, y, z); m.renderOrder = 999; m.frustumCulled = false; return m;
+    };
+    function updateHeldModel() {
+      while (heldGroup.children.length) { const c = heldGroup.children.pop(); c.geometry.dispose(); c.material.dispose(); }
+      if (held === 'block') {
+        heldGroup.rotation.set(0.5, 0.6, 0);
+        heldGroup.add(vmBox(0.12, 0.12, 0.12, MATERIALS[matIdx].color, 0, 0, 0));
+      } else {
+        heldGroup.rotation.set(0.35, -0.4, 0.35);          // a "held" tilt; handle runs along local Y
+        heldGroup.add(vmBox(0.022, 0.30, 0.022, _vmWood, 0, -0.02, 0));   // handle
+        if (held === 'pickaxe') heldGroup.add(vmBox(0.24, 0.03, 0.03, _vmHead, 0, 0.14, 0));        // wide cross-head
+        else if (held === 'shovel') heldGroup.add(vmBox(0.10, 0.13, 0.02, _vmHead, 0, 0.20, 0));    // flat blade on top
+        else if (held === 'axe') heldGroup.add(vmBox(0.12, 0.10, 0.028, _vmHead, 0.07, 0.12, 0));   // blade offset near top
+      }
+    }
+    function selectHeld(h) { held = h; updateHeldModel(); refreshBelt(); drawHud(); }
 
     // ---- HUD + tool belt ----
+    const heldLabel = () => held === 'block' ? `${MATERIALS[matIdx].emoji} ${MATERIALS[matIdx].title}` : `${TOOL_META[held].emoji} ${TOOL_META[held].title}`;
     function drawHud() {
-      const m = MATERIALS[matIdx];
       const mode = camMode === 'fly' ? '🚁 Hover' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
       hud.innerHTML =
         `<span class="chip">🌍 ${columns ? columns.length : 0}</span>` +
-        `<span class="chip">${tool === 'place' ? '🧱 Place' : '⛏️ Mine'}</span>` +
-        `<span class="chip">${m.emoji} ${m.title}</span>` +
+        `<span class="chip">✋ ${heldLabel()}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
         `<span class="chip">🏔️ peak +${peakAbove}</span>` +
         `<span class="chip">🗺️ ${discoveryPct()}%</span>` +
         `<span class="chip">${mode}</span>`;
     }
-    // belt = the two tools + ONE "Materials" button (current pick); the full swatch grid lives in a panel.
+    // belt = the 4 held items (block + pickaxe/shovel/axe) + a "Materials" button to choose the block.
     function refreshBelt() {
       belt.innerHTML = '';
       const mm = MATERIALS[matIdx];
       belt.append(
-        el('button.tool-btn' + (tool === 'place' ? '.active' : ''), { text: '🧱 Place', onclick: () => { tool = 'place'; refreshBelt(); drawHud(); } }),
-        el('button.tool-btn' + (tool === 'mine' ? '.active' : ''), { text: '⛏️ Mine', onclick: () => { tool = 'mine'; refreshBelt(); drawHud(); } }),
+        el('button.tool-btn' + (held === 'block' ? '.active' : ''), { text: `1 ${mm.emoji}`, title: `Place ${mm.title}`, onclick: () => selectHeld('block') }),
+        el('button.tool-btn' + (held === 'pickaxe' ? '.active' : ''), { text: '2 ⛏️', title: 'Pickaxe — rock/stone/ore', onclick: () => selectHeld('pickaxe') }),
+        el('button.tool-btn' + (held === 'shovel' ? '.active' : ''), { text: '3 🪏', title: 'Shovel — dirt/sand/snow', onclick: () => selectHeld('shovel') }),
+        el('button.tool-btn' + (held === 'axe' ? '.active' : ''), { text: '4 🪓', title: 'Axe — wood/leaves', onclick: () => selectHeld('axe') }),
         el('button.mat-toggle' + (matPanelOpen ? '.active' : ''), {
           html: `<span class="sw" style="--sw:#${mm.color.toString(16).padStart(6, '0')}"></span> ${mm.emoji} ${mm.title} ▾`,
           title: 'Materials (B)', onclick: () => toggleMatPanel(),
@@ -518,7 +559,7 @@ export function mountEarth(task) {
             group.append(el('button.mat-btn' + (i === matIdx ? '.active' : ''), {
               text: mm.emoji, title: mm.title,
               style: `--sw:#${mm.color.toString(16).padStart(6, '0')}`,
-              onclick: () => { matIdx = i; toggleMatPanel(false); refreshBelt(); drawHud(); },
+              onclick: () => { matIdx = i; held = 'block'; updateHeldModel(); toggleMatPanel(false); refreshBelt(); drawHud(); },
             }));
           });
           matPanel.append(group);
@@ -527,7 +568,7 @@ export function mountEarth(task) {
       } else matPanel.classList.add('hidden');
       refreshBelt();
     }
-    function cycleMat(d) { matIdx = (matIdx + d + MATERIALS.length) % MATERIALS.length; if (matPanelOpen) toggleMatPanel(true); refreshBelt(); drawHud(); }
+    function cycleMat(d) { matIdx = (matIdx + d + MATERIALS.length) % MATERIALS.length; held = 'block'; updateHeldModel(); if (matPanelOpen) toggleMatPanel(true); refreshBelt(); drawHud(); }
 
     // ---- camera: orbit (from space) → fly (over the surface) → walk (on the ground) ----
     let camMode = 'orbit';
@@ -630,14 +671,15 @@ export function mountEarth(task) {
       if (k === 'h') { legend.classList.toggle('hidden'); return; }
       if (k === 'x') { toggleHover(); return; }              // walk ⇄ hover
       if (k === 'b') { toggleMatPanel(); return; }           // materials picker
-      if (k === 'f') { doPlace(); return; }
-      if (k === 'r') { doMine(); return; }
+      if (k === 'f' || k === 'r') { doUse(); return; }      // use the held item (place block / mine with tool)
       if (k === 'c') { cycleMat(1); return; }
       if (k === 'v') { cycleMat(-1); return; }
       if (k === 't') { timeScale = timeScale === 1 ? 30 : 1; return; }   // fast-forward day/night
-      if (k === '1') { tool = 'place'; refreshBelt(); drawHud(); return; }
-      if (k === '2') { tool = 'mine'; refreshBelt(); drawHud(); return; }
-      if (k === ' ') { e.preventDefault(); if (camMode === 'walk') { keys.add(' '); jump(); } else tool === 'place' ? doPlace() : doMine(); return; }
+      if (k === '1') { selectHeld('block'); return; }
+      if (k === '2') { selectHeld('pickaxe'); return; }
+      if (k === '3') { selectHeld('shovel'); return; }
+      if (k === '4') { selectHeld('axe'); return; }
+      if (k === ' ') { e.preventDefault(); if (camMode === 'walk') { keys.add(' '); jump(); } else doUse(); return; }
       if ('wasdqe'.includes(k)) { keys.add(k); e.preventDefault(); }
     });
     on(window, 'keyup', (e) => keys.delete(e.key.toLowerCase()));
@@ -684,10 +726,10 @@ export function mountEarth(task) {
       if (mapOpen) return;
       if (camMode === 'walk') {
         if (!pointerLocked) { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); return; }
-        tool === 'place' ? doPlace() : doMine();
+        doUse();
         return;
       }
-      if (moved <= 6) tool === 'place' ? doPlace() : doMine();
+      if (moved <= 6) doUse();
     });
     on(renderer.domElement, 'wheel', (e) => {
       if (mapOpen) return;
@@ -762,10 +804,10 @@ export function mountEarth(task) {
           highlight.visible = true;
         }
       }
-      if (target) hiMat.color.setHex(tool === 'mine' ? 0xfca5a5 : 0xffffff);
+      if (target) hiMat.color.setHex(held !== 'block' ? 0xfca5a5 : 0xffffff);
 
-      // ghost previews the place cell (the air cell the ray last passed through, adjacent to the hit face)
-      if (tool !== 'place' || !target || target.placeColId < 0) { ghost.visible = false; lastGhostKey = ''; return; }
+      // ghost previews the place cell (the air cell the ray last passed through) — only when holding a block
+      if (held !== 'block' || !target || target.placeColId < 0) { ghost.visible = false; lastGhostKey = ''; return; }
       const valid = store.getMat(target.placeColId, target.placeL) === AIR;
       ghostMat.color.setHex(valid ? 0x4ade80 : 0xf87171);
       const gkey = `${target.placeColId},${target.placeL}`;
@@ -890,6 +932,7 @@ export function mountEarth(task) {
     }
 
     refreshBelt();
+    updateHeldModel();                                      // build the first-person held viewmodel
     drawHud();
     placeOrbitCamera();                                    // position the camera so the streaming planet renders
     atmU.uCamPos.value.copy(camera.position);
@@ -981,6 +1024,7 @@ export function mountEarth(task) {
       if (mapMesh) { mapMesh.geometry.dispose(); mapMesh.material.dispose(); }
       if (mapMarkPlayer) { mapMarkPlayer.geometry.dispose(); mapMarkPlayer.material.dispose(); }
       if (mapMarkPeak) { mapMarkPeak.geometry.dispose(); mapMarkPeak.material.dispose(); }
+      for (const c of heldGroup.children) { c.geometry.dispose(); c.material.dispose(); }
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     });
