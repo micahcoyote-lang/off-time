@@ -30,7 +30,7 @@
 <script type="module">
 import * as THREE from './assets/vendor/three.module.js';
 import { makeSolidMaterial } from './js/games/planet-mesh.js';
-import { ChunkStreamer } from './js/games/planet-stream.js';
+import { ChunkStreamer, StreamWorld } from './js/games/planet-stream.js';
 import { addressOf } from './js/games/icosphere-address.js';
 import { genColumns } from './js/games/planet-region.js';
 import { MAX_R, R, radius, SEA_L } from './data/planet.js';
@@ -63,7 +63,8 @@ function start() {
   const f = Math.max(32, Math.min(2000, parseInt(document.getElementById('freq').value) || 200));
   const S = Math.max(8, Math.min(64, parseInt(document.getElementById('csize').value) || 24));
   const seed = parseInt(document.getElementById('seed').value) | 0;
-  streamer = new ChunkStreamer({ scene, f, seed, S, solidMat, waterMat, radiusCols: 3 * S, maxChunks: 1200 });
+  const world = new StreamWorld(f, seed, S);
+  streamer = new ChunkStreamer({ scene, world, solidMat, waterMat, radiusCols: 3 * S });
   streamer._f = f; streamer._S = S;
   // place the camera just above the terrain at (0,0,1), looking along the local tangent
   const startDir = new THREE.Vector3(0, 0, 1);
