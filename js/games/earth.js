@@ -19,12 +19,16 @@ import * as THREE from '../../assets/vendor/three.module.js';
 import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin, terrainMeta } from './planet-mesh.js';
+import { terrainFill, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin, terrainMeta, makeSolidMaterial, makeWaterMaterial } from './planet-mesh.js';
 import { compactToStore } from './voxel-store.js';
+import { StreamWorld, ChunkStreamer } from './planet-stream.js';
+import { columnCount, chunkOf, decodeId } from './icosphere-address.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS,
   SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI, SHAPE_FENCE, SHAPE_PANE, SHAPE_STAIRS,
   ROT_MASK, packState, ORIENTED } from '../../data/planet.js';
+
+const CHUNK_S = 24;   // fine-chunk size (cells per chunk side) for region streaming (Phase C cutover)
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
@@ -228,15 +232,20 @@ export function mountEarth(task) {
     const clouds = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.05, 48, 32), cloudMat);
     clouds.frustumCulled = false; clouds.renderOrder = 1; scene.add(clouds);
 
-    // ---- world data (streamed from the worker's `topology` message; see the worker block below) ----
-    // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
-    // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
-    let columns = null, store = null, planet = null;
-    let coarseMeshes = null, coarseMat = null;           // per-chunk LOD globe (hidden where fine streams in)
+    // ---- world data (Phase C scale fork) ----
+    // TWO worlds: a COARSE resident globe (FREQ_COARSE, built main-thread) drives the map / discovery /
+    // landmarks / distant backdrop and owns `columns`/`store`/`nearestColumn`/the chunk index — so all that
+    // code is unchanged. A FINE on-demand StreamWorld (`fw`) drives GAMEPLAY (picking / physics / building),
+    // rendered by the ChunkStreamer (`fstream`) only near the camera. Declared up-front; readers are null-safe.
+    let columns = null, store = null;                    // COARSE resident world (map/landmarks/discovery)
+    let coarseMeshes = null, coarseMat = null;           // the LOD globe (distant backdrop)
     let N = 0, pentagonCount = 0, chunkCount = 0;
     let cx, cy, cz, chunkCols, chCx, chCy, chCz, chEmpty, chunkScanArr;
     let peakCol = 0, peakL = 0, peakAbove = 0;
-    const activeSet = new Set();                          // fine chunk ids currently meshed (E3 streaming)
+    let fw = null, fstream = null, fwaterU = null;        // FINE StreamWorld + chunk streamer + water uniforms
+    const fnear = (x, y, z) => fw.nearestColumn(x, y, z);          // fine nearest-column (gameplay picking)
+    const fcol = (id) => fw.columnOf(id);                         // fine column object {center,boundary,neighbors,chunk}
+    const fineChunksFor = (colId) => { const s = new Set([fcol(colId).chunk]); for (const nb of fcol(colId).neighbors) s.add(fcol(nb).chunk); return s; };
 
     // ---- landmarks (P1b): named peaks/water bodies you discover; in-world signposts + compass ----
     let landmarks = [], beacons = [];                    // registry + their in-world signpost meshes
@@ -293,9 +302,7 @@ export function mountEarth(task) {
       columns = cols; pentagonCount = pentCount; chunkCount = chCount; N = cols.length;
       // compact the transient flat grid into the per-chunk palette store (the resident representation);
       // the flat `cellsArr` is dropped after this — the worker keeps its own copy only until transfer.
-      store = compactToStore(cols, cellsArr, chCount);
-      // re-apply saved per-block state (shapes) onto the store (material edits were already baked into cells)
-      for (const [ci, v] of editStates) store.setState((ci / LAYERS) | 0, ci % LAYERS, v);
+      store = compactToStore(cols, cellsArr, chCount);     // COARSE store (map/landmarks); player edits live in fw
       cx = new Float32Array(N); cy = new Float32Array(N); cz = new Float32Array(N);
       for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
       // bucketed index: per-chunk column lists + centroids + neighbour scan sets
@@ -324,11 +331,10 @@ export function mountEarth(task) {
       if (startCi >= 0) { discovered.add(startCi); for (const nb of chunkScanArr[startCi]) discovered.add(nb); }
       maybeInitFog();
 
-      // fine chunk meshes (created empty; meshed on demand near the camera by updateStreaming)
-      planet = buildPlanetChunks(columns, store, chunkCount, sunDir);
-      planet.meshes.forEach((m) => scene.add(m));
+      // (Phase C) the FINE terrain is no longer a resident mesh set — it streams via fstream. The coarse
+      // globe (built in onCoarse) is the distant backdrop.
 
-      // tallest peak (feeds the landmark registry + the HUD)
+      // tallest peak (feeds the landmark registry + the HUD) — from the coarse globe
       let peakR = -1;
       for (let i = 0; i < N; i++) {
         const top = store.getTop(i);
@@ -381,22 +387,6 @@ export function mountEarth(task) {
       g.add(spBox(0.62, 0.34, 0.05, kind === 'water' ? 0x3f9fc4 : kind === 'river' ? 0x49c2e0 : 0xd8a93a, 1.18));   // sign board near the top
       return g;
     }
-    // worker `topology` message → reconstruct lightweight column objects, then set up the world.
-    // `d.cells` already has the saved edits applied (the worker did it).
-    function onTopology(d) {
-      const n = d.boundaryLen.length, cols = new Array(n);
-      for (let i = 0; i < n; i++) {
-        const bl = d.boundaryLen[i], boundary = new Array(bl), neigh = new Array(bl);
-        for (let k = 0; k < bl; k++) {
-          const o = (i * 6 + k) * 3;
-          boundary[k] = new THREE.Vector3(d.boundary[o], d.boundary[o + 1], d.boundary[o + 2]);
-          neigh[k] = d.neighbors[i * 6 + k];
-        }
-        cols[i] = { id: i, center: new THREE.Vector3(d.centers[i * 3], d.centers[i * 3 + 1], d.centers[i * 3 + 2]), boundary, neighbors: neigh, chunk: d.chunk[i], isPentagon: bl === 5 };
-      }
-      riverLandmark = d.river || null;
-      setupWorld(cols, d.cells, d.pentagonCount, d.chunkCount);
-    }
 
     // worker `coarse` message → the LOD globe as one low-res mesh PER CHUNK (same regions as the fine
     // chunks). Each is shown unless its fine chunk is streamed in (updateStreaming toggles .visible), so
@@ -411,7 +401,7 @@ export function mountEarth(task) {
         if (p.length) { geo.computeVertexNormals(); geo.computeBoundingSphere(); }
         const m = new THREE.Mesh(geo, coarseMat);
         m.frustumCulled = p.length > 0;                  // small regional patches → frustum-cull off-screen
-        m.visible = !activeSet.has(i);                   // hidden if this region is already fine
+        m.visible = true; m.scale.setScalar(0.992);      // (Phase C) always-on backdrop, inset so streamed fine terrain sits above it
         coarseMeshes[i] = m; scene.add(m);
       }
       // build the merged single-mesh globe for the world map (separate from the live coarse meshes,
@@ -592,45 +582,13 @@ export function mountEarth(task) {
       drawHud();
     }
 
-    // E3 streaming: choose which fine chunks stay meshed — the patch around the surface point under the
-    // camera in fly/walk; none in orbit (the coarse globe covers the whole planet there).
-    function computeWantActive() {
-      const want = new Set();
-      if (!planet || camMode === 'orbit') return want;
-      const px = anchor.x, py = anchor.y, pz = anchor.z;
-      const alt = Math.max(0.1, camera.position.length() - camSurfR);
-      const horizon = Math.acos(Math.min(1, camSurfR / (camSurfR + alt)));   // angular distance to the horizon
-      const cosT = Math.cos(Math.min(Math.PI, horizon + STREAM_MARGIN));
-      const cand = [];
-      for (let ci = 0; ci < chunkCount; ci++) {
-        if (chEmpty[ci]) continue;
-        if (chCx[ci] * px + chCy[ci] * py + chCz[ci] * pz > cosT) cand.push(ci);
-      }
-      if (cand.length > MAX_ACTIVE_CHUNKS) {           // keep the nearest cap-many
-        cand.sort((a, b) => (chCx[b] * px + chCy[b] * py + chCz[b] * pz) - (chCx[a] * px + chCy[a] * py + chCz[a] * pz));
-        cand.length = MAX_ACTIVE_CHUNKS;
-      }
-      for (const ci of cand) want.add(ci);
-      return want;
-    }
-    // unload chunks that left the patch (cheap) + mesh newly-entered ones incrementally (budgeted).
+    // (Phase C) fine terrain streams on demand via the ChunkStreamer — load/unload chunks around the surface
+    // point under the camera. None in orbit (the coarse globe covers the whole planet there).
     function updateStreaming(budgetMs) {
-      if (!planet) return;
-      const want = computeWantActive();
-      // chunks that left the patch: unload fine, show coarse again
-      for (const id of [...activeSet]) if (!want.has(id)) {
-        planet.unload([id]); activeSet.delete(id);
-        if (coarseMeshes) coarseMeshes[id].visible = true;
-      }
-      // chunks that entered the patch: mesh fine incrementally, then hide their coarse
-      const t0 = performance.now();
-      for (const id of want) {
-        if (activeSet.has(id)) continue;
-        planet.rebuild([id]); activeSet.add(id);
-        if (coarseMeshes) coarseMeshes[id].visible = false;
-        if (performance.now() - t0 >= budgetMs) break;   // finish the rest next frame
-      }
-      if (window.__earthDebug) { window.__earthDebug.activeChunks = activeSet.size; window.__earthDebug.fineTris = planet.triCount; }
+      window.__usN = (window.__usN || 0) + 1;
+      if (!fstream || camMode === 'orbit') { window.__streamDbg = { skip: !fstream ? 'no-fstream' : 'orbit' }; return; }
+      try { const info = fstream.update(anchor, budgetMs); window.__streamDbg = { ...info, frame: window.__frameN }; }
+      catch (e) { window.__streamDbg = { err: String(e && e.stack || e) }; }
     }
 
     // ---- selection wireframe (black hexel-prism outline, PlanetSmith-style) + breaking crack overlay ----
@@ -668,22 +626,13 @@ export function mountEarth(task) {
     let needsTarget = true;                               // recompute target this frame (set on edit)
     let shadowDirty = true, shadowAcc = 0;                // refresh shadow map on edits + a few times/sec
 
-    // chunks whose geometry an edit at `colId` can change (its own + cross-chunk neighbors)
-    function affectedChunks(colId) {
-      const s = new Set([columns[colId].chunk]);
-      for (const nb of columns[colId].neighbors) if (nb >= 0) s.add(columns[nb].chunk);
-      return s;
-    }
     function applyEdit(colId, L, m, state = 0) {
       const ci = cellIndex(colId, L);
-      store.setMat(colId, L, m); edits.set(ci, m);
-      // per-block state (Phase 2): shape (low bits) + orientation; mining (AIR) clears it
-      const st = (m === AIR ? 0 : (state & (SHAPE_MASK | ROT_MASK)));
-      store.setState(colId, L, st); if (st) editStates.set(ci, st); else editStates.delete(ci);
-      // re-mesh only affected chunks that are currently streamed-in; others have the store updated and
-      // will mesh correctly when next activated.
-      const affected = [...affectedChunks(colId)].filter((id) => activeSet.has(id));
-      if (affected.length) planet.rebuild(affected);
+      const st = (m === AIR ? 0 : (state & (SHAPE_MASK | ROT_MASK)));   // per-block shape/rot; mining clears it
+      fw.edit(colId, L, m, st);                            // persists across chunk eviction (StreamWorld)
+      edits.set(ci, m); if (st) editStates.set(ci, st); else editStates.delete(ci);
+      // re-mesh the affected fine chunks (the edited chunk + its neighbours, for cross-chunk culling)
+      fstream.rebuild(fineChunksFor(colId));
       needsTarget = true; shadowDirty = true;             // surface height changed under the crosshair
       persist(); markTaskDone('earth'); drawHud();
     }
@@ -691,7 +640,7 @@ export function mountEarth(task) {
     function doUse() { if (held === 'block') doPlace(); else doMine(); }
     function doPlace() {
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
-      if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
+      if (fw.getMat(target.placeColId, target.placeL) !== AIR) return;
       const rot = ORIENTED.has(heldShape) ? placeRot(target.placeColId, heldShape === SHAPE_PANE) : 0;
       applyEdit(target.placeColId, target.placeL, matNum(), packState(heldShape, rot));
     }
@@ -700,7 +649,7 @@ export function mountEarth(task) {
     // step rises along the view direction (away from you).
     const _pr1 = new THREE.Vector3(), _pr2 = new THREE.Vector3(), _pr3 = new THREE.Vector3();
     function placeRot(colId, perp) {
-      const col = columns[colId], C = col.center, b = col.boundary, nb = b.length;
+      const col = fcol(colId), C = col.center, b = col.boundary, nb = b.length;
       _pr1.copy(fwd).addScaledVector(C, -fwd.dot(C));                          // view direction in the cell's tangent plane
       if (_pr1.lengthSq() < 1e-6) return 0;
       if (perp) _pr2.crossVectors(C, _pr1).normalize(); else _pr2.copy(_pr1).normalize();
@@ -710,7 +659,7 @@ export function mountEarth(task) {
     }
     function doMine() {
       if (!target) return;
-      const m = store.getMat(target.colId, target.L);
+      const m = fw.getMat(target.colId, target.L);
       if (m === AIR || m === WATER) return;                // water is a liquid — not mineable
       if (held === 'block' || !TOOLSET[held].has(m)) {     // wrong tool → hint, no dig
         const need = TOOL_META[toolForMat(m)]; showHint(`Need a ${need.emoji} ${need.title}`); return;
@@ -772,7 +721,7 @@ export function mountEarth(task) {
     function drawHud() {
       const mode = camMode === 'fly' ? '🚁 Hover' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
       hud.innerHTML =
-        `<span class="chip">🌍 ${columns ? columns.length : 0}</span>` +
+        `<span class="chip">🌍 ${columnCount(FREQ).toLocaleString()}</span>` +
         `<span class="chip">✋ ${heldLabel()}</span>` +
         `<span class="chip">✏️ ${edits.size}</span>` +
         `<span class="chip">🧭 ${discoveredLandmarks.size}/${landmarks.length}</span>` +
@@ -864,9 +813,8 @@ export function mountEarth(task) {
     // surface radius (top of the tallest solid cell) under a unit direction — lets fly mode hug
     // the actual terrain instead of a fixed high shell, so you can get low and "forward" reads right
     function surfaceRadiusAt(v) {
-      const best = nearestColumn(v.x, v.y, v.z);
-      if (best < 0) return radius(0);
-      const top = store.getTop(best);
+      if (!fw) return radius(SEA_L);
+      const top = fw.getTop(fnear(v.x, v.y, v.z));
       return top >= 0 ? radius(top + 1) : radius(0);
     }
     // The floor under the player at direction `v`, given their current feet radius `fromR`. Finds the
@@ -875,13 +823,13 @@ export function mountEarth(task) {
     // surface. Also reports the water surface (for wade/swim) and whether the body fits above the floor
     // (head clearance) so you can't walk into a too-short gap.
     function groundInfo(v, fromR) {
-      const best = nearestColumn(v.x, v.y, v.z);
-      if (best < 0) return { solidR: radius(0), waterTopR: 0, headroom: true };
+      if (!fw) return { solidR: radius(SEA_L), waterTopR: 0, headroom: true };
+      const best = fnear(v.x, v.y, v.z);
       const Lf = Math.max(0, Math.floor((fromR - radius(0)) / TH));
       const ceilL = Math.min(LAYERS - 1, Lf + STEP_LAYERS);
       let floorL = -1, waterTopR = 0;
       for (let L = ceilL; L >= 0; L--) {
-        const m = store.getMat(best, L);
+        const m = fw.getMat(best, L);
         if (m === AIR) continue;
         if (m === WATER) { if (waterTopR === 0) waterTopR = radius(L + 1); continue; }
         floorL = L; break;                                    // highest solid at/below the step-up ceiling
@@ -889,7 +837,7 @@ export function mountEarth(task) {
       const solidR = floorL < 0 ? radius(0) : radius(floorL + 1);
       let headroom = true;                                    // body cells above the floor must be air/water
       for (let L = floorL + 1; L <= floorL + BODY_LAYERS && L < LAYERS; L++) {
-        const m = store.getMat(best, L);
+        const m = fw.getMat(best, L);
         if (m !== AIR && m !== WATER) { headroom = false; break; }
       }
       return { solidR, waterTopR, headroom };
@@ -1001,7 +949,11 @@ export function mountEarth(task) {
     let cpx = NaN, cpy = 0, cpz = 0, cqx = 0, cqy = 0, cqz = 0, cqw = 0;
     function cameraMoved() {
       const p = camera.position, q = camera.quaternion;
-      if (p.x === cpx && p.y === cpy && p.z === cpz && q.x === cqx && q.y === cqy && q.z === cqz && q.w === cqw) return false;
+      // threshold (not exact equality): idle gravity jitter sub-hexel must NOT re-target every frame — the
+      // streaming-mode raycast generates chunks + runs addressOf, so re-targeting on jitter starves streaming.
+      const dp = Math.abs(p.x - cpx) + Math.abs(p.y - cpy) + Math.abs(p.z - cpz);
+      const dq = Math.abs(q.x - cqx) + Math.abs(q.y - cqy) + Math.abs(q.z - cqz) + Math.abs(q.w - cqw);
+      if (dp < 0.03 && dq < 0.0008) return false;
       cpx = p.x; cpy = p.y; cpz = p.z; cqx = q.x; cqy = q.y; cqz = q.z; cqw = q.w; return true;
     }
     // March the crosshair ray through the radial voxel grid and return the FIRST solid cell (mine
@@ -1010,6 +962,7 @@ export function mountEarth(task) {
     // MAX_R shell entry (when the camera is outside) rather than at the far camera.
     const _base0 = radius(0), _STEP = TH * 0.5;
     function raycastVoxel() {
+      if (!fw) return null;
       raycaster.setFromCamera(CENTER, camera);
       _ro.copy(raycaster.ray.origin); _rd.copy(raycaster.ray.direction);
       const r0 = _ro.length();
@@ -1020,18 +973,33 @@ export function mountEarth(task) {
         t0 = (-b - Math.sqrt(disc)) / 2;
         if (t0 < 0) return null;                            // shell is behind the camera
       }
-      const tEnd = t0 + MAX_R * 2;                          // generous reach; the march breaks earlier
-      let prevCol = -1, prevL = -1;                         // last air cell = placement target
+      // (Phase C) CAP the reach: each ray step reads fw.getMat, which GENERATES the chunk on demand — an
+      // unbounded march would generate chunks across the whole planet every frame and hang the loop. Building
+      // only targets a few cells ahead, so a short reach keeps picking within the already-loaded neighbourhood.
+      const tEnd = t0 + 12;
+      let prevCol = -1, prevL = -1, curCol = -1;            // last air cell = placement target; curCol = reuse cache
       for (let t = t0 + 1e-4; t <= tEnd; t += _STEP) {
         _p.copy(_rd).multiplyScalar(t).add(_ro);
         const r = _p.length();
         if (r > MAX_R) { if (t > t0 + _STEP) break; else continue; }   // exited the shell
         if (r < _base0) break;                              // reached the solid core
-        const inv = 1 / r, col = nearestColumn(_p.x * inv, _p.y * inv, _p.z * inv);
+        const inv = 1 / r, dx = _p.x * inv, dy = _p.y * inv, dz = _p.z * inv;
+        // the ray marches mostly radially, so the column changes slowly — walk to the nearest neighbour
+        // (cheap dot products) instead of a full addressOf every step (addressOf is too slow per-step at FREQ).
+        let col;
+        if (curCol >= 0) {
+          col = curCol;
+          for (let hop = 0; hop < 4; hop++) {
+            const c = fcol(col); let bd = c.center.x * dx + c.center.y * dy + c.center.z * dz, nx = -1;
+            for (const nb of c.neighbors) { const nc = fcol(nb).center; const d = nc.x * dx + nc.y * dy + nc.z * dz; if (d > bd) { bd = d; nx = nb; } }
+            if (nx < 0) break; col = nx;
+          }
+          curCol = col;
+        } else { col = fnear(dx, dy, dz); curCol = col; }
         if (col < 0) continue;
         let L = Math.floor((r - _base0) / TH);
         if (L < 0) L = 0; else if (L >= LAYERS) L = LAYERS - 1;
-        if (store.getMat(col, L) !== AIR) return { colId: col, L, placeColId: prevCol, placeL: prevL };
+        if (fw.getMat(col, L) !== AIR) return { colId: col, L, placeColId: prevCol, placeL: prevL };
         prevCol = col; prevL = L;
       }
       return null;
@@ -1055,7 +1023,7 @@ export function mountEarth(task) {
         lastSelKey = skey;
         if (selCol < 0) selBox.visible = false;
         else {
-          selGeo.setAttribute('position', new THREE.Float32BufferAttribute(hexelWire(columns[selCol], selL), 3));
+          selGeo.setAttribute('position', new THREE.Float32BufferAttribute(hexelWire(fcol(selCol), selL), 3));
           selBox.visible = true;
         }
       }
@@ -1064,7 +1032,7 @@ export function mountEarth(task) {
       if (breaking && target && breaking.colId === target.colId && breaking.L === target.L) {
         crackMat.opacity = 0.15 + 0.6 * Math.min(1, breaking.hits / (HITS[held] || 4));
         const ck = `${breaking.colId},${breaking.L}`;
-        if (ck !== crackKey) { crackKey = ck; crackGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(columns[breaking.colId], breaking.L), 3)); }
+        if (ck !== crackKey) { crackKey = ck; crackGeo.setAttribute('position', new THREE.Float32BufferAttribute(cellPrism(fcol(breaking.colId), breaking.L), 3)); }
         crack.visible = true;
       } else { crack.visible = false; crackKey = ''; }
     }
@@ -1090,6 +1058,7 @@ export function mountEarth(task) {
     }
     function frame(t) {
       raf = requestAnimationFrame(frame);
+      window.__frameN = (window.__frameN || 0) + 1;
       const dt = lastT ? Math.min((t - lastT) / 1000, 0.05) : 0.016; lastT = t;
       const w = view.clientWidth, h = view.clientHeight;
       if (w && h && (w !== lastW || h !== lastH)) {
@@ -1145,15 +1114,16 @@ export function mountEarth(task) {
       atmU.uCamPos.value.copy(camera.position);            // atmosphere/sky need the eye position
       atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
       scene.fog.density = camMode === 'orbit' ? 0 : FOG_DENSITY;   // no haze from space (would hide the planet)
-      planet.waterUniforms.uTime.value += dt;              // animate the water surface (uSunDir is shared/live)
+      if (fwaterU) fwaterU.uTime.value += dt;              // animate the streamed water surface (uSunDir is shared/live)
       cloudU.uTime.value += dt;                            // drift the cloud cover
       shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
-      if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
+      if (cameraMoved() || needsTarget) { try { updateTargeting(); } catch (e) { window.__targDbg = String(e && e.stack || e); } needsTarget = false; }
       updateStreaming(6);                                  // E3: load/unload fine chunks around the camera
 
-      // map discovery + landmark discovery + compass: as you roam (fly/walk only)
-      if (planet && !mapOpen && (camMode === 'fly' || camMode === 'walk')) {
+      // map discovery + landmark discovery + compass: as you roam (fly/walk only). Discovery is COARSE —
+      // `columns`/`nearestColumn` are the coarse globe, so the map reveals at coarse-region granularity.
+      if (store && !mapOpen && (camMode === 'fly' || camMode === 'walk')) {
         const ci = columns[nearestColumn(anchor.x, anchor.y, anchor.z)]?.chunk;
         if (ci != null && ci >= 0 && !discovered.has(ci)) {
           reveal(ci); for (const nb of chunkScanArr[ci]) reveal(nb);
@@ -1162,7 +1132,7 @@ export function mountEarth(task) {
         discoverLandmarks();
         updateJourney();
       }
-      if (planet) updateCompass();
+      if (store) updateCompass();
 
       renderer.render(scene, camera);                      // pass 1 — the live world
 
@@ -1193,23 +1163,20 @@ export function mountEarth(task) {
     placeOrbitCamera();                                    // position the camera so the streaming planet renders
     atmU.uCamPos.value.copy(camera.position);
 
-    // ---- generation: a Web Worker builds the world OFF-THREAD and STREAMS it in (no main-thread
-    // freeze). Edits stay on main (local planet.rebuild). Falls back to in-main generation if Workers
-    // are unavailable, so the offline PWA still works on any engine. ----
-    let worker = null;
-    // drop the player onto solid LAND in walk mode (the orbit view was only for the load). If the start
-    // direction (0,0,1) is ocean, BFS outward over neighbours to the nearest land column.
+    // ---- generation (Phase C): main-thread coarse globe + on-demand fine streaming (see generate() below) ----
+    // drop the player onto solid LAND in walk mode. If the start direction (0,0,1) is ocean, BFS outward
+    // over fine neighbours to the nearest land column.
     function spawnOnLand() {
-      // a clean spawn = solid GROUND on top (a 'terrain' material), not water and not a tree block
-      // (wood/leaves are kind 'block', so spawning never lands you on a canopy)
-      const isLand = (id) => { const t = store.getTop(id); if (t <= SEA_L) return false; const mk = MATERIALS[store.getMat(id, t) - 1]; return mk && mk.kind === 'terrain' && mk.id !== 'water'; };
-      let spawn = Math.max(0, nearestColumn(0, 0, 1));
+      // a clean spawn = solid GROUND on top (a 'terrain' material), not water and not a tree block — on the
+      // FINE world (the actual playable terrain). BFS outward over fine neighbours if (0,0,1) is ocean.
+      const isLand = (id) => { const t = fw.getTop(id); if (t <= SEA_L) return false; const mk = MATERIALS[fw.getMat(id, t) - 1]; return mk && mk.kind === 'terrain' && mk.id !== 'water'; };
+      let spawn = fnear(0, 0, 1);
       if (!isLand(spawn)) {
         const seen = new Set([spawn]); let frontier = [spawn];
         search: for (let d = 0; d < 80 && frontier.length; d++) {
           const next = [];
-          for (const id of frontier) for (const nb of columns[id].neighbors) {
-            if (nb < 0 || seen.has(nb)) continue;
+          for (const id of frontier) for (const nb of fcol(id).neighbors) {
+            if (seen.has(nb)) continue;
             seen.add(nb);
             if (isLand(nb)) { spawn = nb; break search; }
             next.push(nb);
@@ -1217,75 +1184,70 @@ export function mountEarth(task) {
           frontier = next;
         }
       }
-      anchor.copy(columns[spawn].center);
+      anchor.copy(fcol(spawn).center);
       fwd.set(anchor.z, 0, -anchor.x); if (fwd.lengthSq() < 1e-6) fwd.set(1, 0, 0); fwd.normalize(); reorthoFly();
       feetR = surfaceRadiusAt(anchor); velR = 0; grounded = true; wpitch = -0.1;
       camMode = 'walk'; camSurfR = feetR; placeWalkCamera();
-      const ci = columns[spawn].chunk;                     // discover the spawn region
-      if (ci >= 0) { reveal(ci); for (const nb of chunkScanArr[ci]) reveal(nb); }
+      const cci = store ? columns[nearestColumn(anchor.x, anchor.y, anchor.z)]?.chunk : -1;   // COARSE chunk → discovery
+      if (cci != null && cci >= 0) { reveal(cci); for (const nb of chunkScanArr[cci]) reveal(nb); }
     }
     function onDone() {
-      let coarseTris = 0;
-      if (coarseMeshes) for (const m of coarseMeshes) coarseTris += (m.geometry.attributes.position?.count || 0) / 3;
-      if (columns) spawnOnLand();                          // land the player before handing off to the loop
-      window.__earthDebug = { columns: N, pentagons: pentagonCount, chunks: chunkCount, coarseTris, fineTris: 0, activeChunks: 0, seed,
+      if (fw) spawnOnLand();                               // land the player before handing off to the loop
+      window.__earthDebug = { columns: columnCount(FREQ), coarseChunks: chunkCount, seed, S: CHUNK_S,
         get mapOpen() { return mapOpen; }, get discovered() { return discovered.size; }, get discoveryPct() { return discoveryPct(); },
         get camMode() { return camMode; },
         get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; },
-        get spawnTopMat() { const id = nearestColumn(anchor.x, anchor.y, anchor.z); return id < 0 ? -1 : store.getMat(id, store.getTop(id)); },
+        get spawnTopMat() { const id = fnear(anchor.x, anchor.y, anchor.z); return fw.getMat(id, fw.getTop(id)); },
         get landmarks() { return landmarks.map((l) => ({ kind: l.kind, name: l.name, colId: l.colId, aboveSea: l.aboveSea, chunk: l.chunk })); },
         get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); },
         get waypoint() { return waypoint; }, get laps() { return laps; }, get lapSigned() { return +lapSigned.toFixed(3); },
-        get river() { return riverLandmark; }, get heldShape() { return heldShape; }, get states() { return store ? store.state.size : 0; },
+        get river() { return riverLandmark; }, get heldShape() { return heldShape; }, get states() { return fw ? fw.state.size : 0; },
+        get activeChunks() { return fstream ? fstream.active.size : 0; }, get cachedChunks() { return fw ? fw.cache.map.size : 0; },
         setWaypoint(c) { waypoint = c; persist(); drawHud(); }, stepJourney() { updateJourney(); },
-        place(colId, L, m, shape) { applyEdit(colId, L, m, shape || 0); }, getState(colId, L) { return store.getState(colId, L); },
-        get playerCol() { return nearestColumn(anchor.x, anchor.y, anchor.z); }, topOf(colId) { return store.getTop(colId); },
-        get activeList() { return [...activeSet]; }, chunkOf(colId) { return columns[colId].chunk; } };
-      console.log('[earth] hex planet:', window.__earthDebug);
+        place(colId, L, m, shape) { applyEdit(colId, L, m, shape || 0); }, getState(colId, L) { return fw.getState(colId, L); },
+        get playerCol() { return fnear(anchor.x, anchor.y, anchor.z); }, topOf(colId) { return fw.getTop(colId); },
+        chunkOf(colId) { return fcol(colId).chunk; },
+        get camPos() { const p = camera.position; return { x: +p.x.toFixed(2), y: +p.y.toFixed(2), z: +p.z.toFixed(2), r: +p.length().toFixed(2) }; },
+        get feetR() { return +feetR.toFixed(2); }, get streamChildren() { return fstream ? fstream.group.children.length : -1; },
+        get coarseN() { return coarseMeshes ? coarseMeshes.length : -1; }, get sceneN() { return scene.children.length; },
+        get sampleChunkVerts() { for (const e of fstream.active.values()) if (e.solid) return e.solid.geometry.getAttribute('position').count; return 0; },
+        streamStep(ms) { try { const t = performance.now(); const i = fstream.update(anchor, ms || 50); return { info: i, pending: fstream.pending.length, lastChunk: fstream.lastChunk, ms: (performance.now() - t) | 0 }; } catch (e) { return { err: String(e && e.stack || e) }; } } };
+      console.log('[earth] hex planet (streaming):', window.__earthDebug);
       overlay.remove();
-      if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand
       raf = requestAnimationFrame(frame);                  // hand off to the normal render loop
     }
-    function runFallback() {                               // no Worker: generate on the main thread (E1 path)
-      const topo = buildHexSphere(FREQ);
-      const localCells = terrainFill(topo.columns, seed);
-      riverLandmark = terrainMeta.river || null;          // capture before the coarse terrainFill below clears it
-      for (const [c, m] of edits) if (c >= 0 && c < localCells.length) localCells[c] = m;
-      setupWorld(topo.columns, localCells, topo.pentagonCount, topo.chunkCount);
-      const cg = buildHexSphere(FREQ_COARSE), ccells = terrainFill(cg.columns, seed);   // coarse LOD globe (per chunk)
-      const cgroups = Array.from({ length: cg.chunkCount }, () => []);
-      for (const col of cg.columns) cgroups[col.chunk].push(col);
-      const cpos = cgroups.map((g) => meshSurfaceSkin(g, ccells));
-      onCoarse({ chunkCount: cg.chunkCount, pos: cpos.map((s) => s.pos), col: cpos.map((s) => s.col) });
+    // (Phase C) generate on the MAIN thread: a cheap COARSE resident globe (map / landmarks / backdrop) +
+    // a FINE on-demand StreamWorld (gameplay) rendered by the chunk streamer. No worker — the heavy fine
+    // world is lazy/streamed, so there's nothing big to build up front (FREQ_COARSE build is ~instant).
+    function generate() {
+      const cTopo = buildHexSphere(FREQ_COARSE);
+      const cCells = terrainFill(cTopo.columns, seed);
+      riverLandmark = terrainMeta.river || null;
+      // FINE streaming world FIRST — scanLandmarks' surfaceRadiusAt reads fine heights
+      fw = new StreamWorld(FREQ, seed, CHUNK_S, edits, editStates);
+      const solidMat = makeSolidMaterial();
+      const wm = makeWaterMaterial(atmU.uSunDir.value); fwaterU = wm.uniforms;
+      fstream = new ChunkStreamer({ scene, world: fw, solidMat, waterMat: wm.material, radiusCols: 3 * CHUNK_S });
+      // COARSE resident globe: columns/store/chunk index + landmarks (setupWorld) + backdrop meshes (onCoarse)
+      setupWorld(cTopo.columns, cCells, cTopo.pentagonCount, cTopo.chunkCount);
+      const cgroups = Array.from({ length: cTopo.chunkCount }, () => []);
+      for (const col of cTopo.columns) cgroups[col.chunk].push(col);
+      const cpos = cgroups.map((g) => meshSurfaceSkin(g, cCells));
+      onCoarse({ chunkCount: cTopo.chunkCount, pos: cpos.map((s) => s.pos), col: cpos.map((s) => s.col) });
       onDone();
     }
-    try {
-      if (typeof Worker === 'undefined') throw new Error('Worker unsupported');
-      worker = new Worker(new URL('./planet-worker.js', import.meta.url), { type: 'module' });
-      worker.onerror = () => { if (worker) { worker.terminate(); worker = null; } if (!planet) runFallback(); };
-      worker.onmessage = (e) => {
-        const d = e.data;
-        if (d.type === 'topology') onTopology(d);
-        else if (d.type === 'coarse') { onCoarse(d); renderer.render(scene, camera); }   // orbit shows the globe immediately
-        else if (d.type === 'done') onDone();
-      };
-      worker.postMessage({ type: 'init', freq: FREQ, seed, edits: [...edits].map(([c, m]) => ({ c, m })) });
-    } catch (err) {
-      console.warn('[earth] worker unavailable, building on the main thread:', err);
-      runFallback();
-    }
+    generate();
 
     disposers.push(() => {
-      if (worker) { worker.terminate(); worker = null; }
       if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.();
-      if (planet) { planet.meshes.forEach((m) => scene.remove(m)); planet.dispose(); }
+      if (fstream) fstream.dispose();
       scene.remove(selBox); selGeo.dispose(); selMat.dispose();
       scene.remove(crack); crackGeo.dispose(); crackMat.dispose();
       scene.remove(rim); rim.geometry.dispose(); rimMat.dispose();
       scene.remove(sky); sky.geometry.dispose(); skyMat.dispose();
       for (const b of beacons) { scene.remove(b); b.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); }); }
       if (coarseMeshes) { for (const m of coarseMeshes) { scene.remove(m); m.geometry.dispose(); } coarseMat.dispose(); }
-      if (planet) persist();                               // flush discovered regions before teardown
+      if (fw) persist();                                   // flush discovered regions before teardown
       if (mapMesh) { mapMesh.geometry.dispose(); mapMesh.material.dispose(); }
       if (mapMarkPlayer) { mapMarkPlayer.geometry.dispose(); mapMarkPlayer.material.dispose(); }
       if (mapMarkWp) { mapMarkWp.geometry.dispose(); mapMarkWp.material.dispose(); }

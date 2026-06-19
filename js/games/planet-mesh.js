@@ -524,27 +524,19 @@ export function makeSolidMaterial() {
   return solidMat;
 }
 
-/* Build the planet as `chunkCount` meshes (grouped by column.chunk). All meshes are created EMPTY up front
-   (added to the scene immediately) and filled INCREMENTALLY by buildNext() so a big planet doesn't freeze the
-   tab. Returns a manager that also rebuilds individual chunks cheaply on edits. */
-export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
-  const groups = Array.from({ length: chunkCount }, () => []);
-  for (const col of columns) groups[col.chunk].push(col);
-  const solidMat = makeSolidMaterial();
-
-  // Water is a second, translucent pass with its OWN shader: per-vertex depth tint (vColor) +
-  // a gentle radial wave bob + fresnel sheen + a sun-specular glint that tracks the day/night sun.
-  // Uniforms share earth.js's live `sunDir`; the caller bumps uTime each frame. (ShaderMaterial
-  // auto-provides position/normal/matrices/cameraPosition; we declare the color attribute ourselves.)
-  const waterUniforms = {
+/* Water: a translucent pass with its OWN shader — per-vertex depth tint (vColor) + a gentle radial wave bob +
+   fresnel sheen + a sun-specular glint that tracks the day/night sun. uSunDir shares earth.js's live sun; the
+   caller bumps uTime each frame. Returns {material, uniforms}. Exported so the chunk STREAMER reuses it. */
+export function makeWaterMaterial(sunDir) {
+  const uniforms = {
     uTime: { value: 0 },
     uSunDir: { value: sunDir || new THREE.Vector3(1, 0, 0) },
     uWave: { value: WATER_WAVE },
     uShallow: { value: WATER_SHALLOW_C }, uDeep: { value: WATER_DEEP_C },   // the depth-tint endpoints → recover depth in-shader
     uShoalA: { value: 0.30 }, uDeepA: { value: 0.88 },                       // alpha: see-through shallows → opaque deeps
   };
-  const waterMat = new THREE.ShaderMaterial({
-    uniforms: waterUniforms,
+  const material = new THREE.ShaderMaterial({
+    uniforms,
     transparent: true, depthWrite: false,
     vertexShader: `
       attribute vec3 color; uniform float uTime, uWave;
@@ -580,6 +572,16 @@ export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
         gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
       }`,
   });
+  return { material, uniforms };
+}
+
+/* Build the planet as `chunkCount` meshes (grouped by column.chunk), created empty and filled INCREMENTALLY
+   by buildNext() (resident path). Returns a manager that rebuilds individual chunks cheaply on edits. */
+export function buildPlanetChunks(columns, store, chunkCount, sunDir) {
+  const groups = Array.from({ length: chunkCount }, () => []);
+  for (const col of columns) groups[col.chunk].push(col);
+  const solidMat = makeSolidMaterial();
+  const { material: waterMat, uniforms: waterUniforms } = makeWaterMaterial(sunDir);
 
   // disable frustum culling on empty geometry (no vertices → boundingSphere would be NaN and warn)
   const setCull = (mesh) => { mesh.frustumCulled = (mesh.geometry.getAttribute('position')?.count || 0) > 0; };
