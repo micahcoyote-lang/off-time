@@ -12,7 +12,8 @@
 
 import * as THREE from '../../assets/vendor/three.module.js';
 import { LAYERS, CORE_L, SEA_L, MATERIALS, radius, AO_MIN,
-  WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE } from '../../data/planet.js';
+  WATER_SHALLOW, WATER_DEEP, WATER_MAX_DEPTH, WATER_WAVE,
+  SHAPE_MASK, SHAPE_SLAB_LO, SHAPE_SLAB_HI } from '../../data/planet.js';
 
 // numeric material ids: 0 = air, 1..N = MATERIALS[i-1]
 export const AIR = 0;
@@ -275,7 +276,7 @@ export function terrainFill(columns, seed) {
 
 /* ---- geometry assembly (face-culled, vertex-colored) ---- */
 const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _nrm = new THREE.Vector3(), _out = new THREE.Vector3();
-const _ref = new THREE.Vector3();
+const _ref = new THREE.Vector3(), _capRef = new THREE.Vector3();
 const _top = new THREE.Color(), _sideC = new THREE.Color(), _sideBot = new THREE.Color();
 const GRASS_NUM = NUM.grass, WATER_NUM = NUM.water, DIRT_COL = COLORS[NUM.dirt];   // grass shows dirt on its sides
 const WALL_BASE_AO = 0.7;                                   // wall bottoms this fraction as bright as tops
@@ -328,28 +329,42 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     if (m !== WATER_NUM) { seabed = L; break; }              // topmost solid below the water
   }
   if (waterTop >= 0) _wcol.copy(WATER_SHALLOW_C).lerp(WATER_DEEP_C, Math.min(1, Math.max(0, waterTop - seabed) / WATER_MAX_DEPTH));
+  const hasStates = s.state && s.state.size > 0;                  // skip per-cell state lookups on un-edited worlds
   for (let L = 0; L <= top; L++) {
     const matn = s.getMat(id, L);
     if (matn === AIR) continue;
     const positions = matn === WATER_NUM ? wPos : sPos;            // route water to its own mesh
     const colors = matn === WATER_NUM ? wCol : sCol;
-    const rOut = radius(L + 1), rIn = radius(L);
-    _ref.copy(col.center).multiplyScalar((rIn + rOut) / 2);        // this cell's center
+    // block shape (Phase 2): full hexel, or a half-height slab. Water is never shaped.
+    const shape = (hasStates && matn !== WATER_NUM) ? (s.getState(id, L) & SHAPE_MASK) : 0;
+    const rOutF = radius(L + 1), rInF = radius(L), rMid = (rInF + rOutF) / 2;
+    const rHi = shape === SHAPE_SLAB_LO ? rMid : rOutF;            // the band this cell's solid actually fills
+    const rLo = shape === SHAPE_SLAB_HI ? rMid : rInF;
+    _ref.copy(col.center).multiplyScalar((rLo + rHi) / 2);         // ref at the band mid → side-wall winding
 
-    const topAir = (L + 1 >= LAYERS) || s.getMat(id, L + 1) === AIR;
-    if (topAir) {
-      // AO: darken a top face that's hemmed in by taller neighbours (pit floor / wall base)
+    // TOP cap (faces up): a full / top-slab cell shows it when the cell above is open; a bottom slab's cap
+    // at rMid is always exposed to the air filling the upper half of its cell.
+    const aboveOpen = (L + 1 >= LAYERS) || s.getMat(id, L + 1) === AIR;
+    if (shape === SHAPE_SLAB_LO || aboveOpen) {
       let walled = 0;
-      for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }
+      if (shape === 0) for (let k = 0; k < n; k++) { const nb = neigh[k]; if (nb >= 0 && L + 1 < LAYERS && s.getMat(nb, L + 1) !== AIR) walled++; }
       const aoTop = 1 - (1 - AO_MIN) * (walled / n);
       if (matn === WATER_NUM) _top.copy(_wcol);                         // pure depth tint → shader recovers depth for its alpha
       else _top.copy(COLORS[matn]).multiplyScalar(aoTop);
-      const ctr = col.center.clone().multiplyScalar(rOut);
+      const ctr = col.center.clone().multiplyScalar(rHi);
       for (let k = 0; k < n; k++)
-        pushTri(ctr, bnd[k].clone().multiplyScalar(rOut), bnd[(k + 1) % n].clone().multiplyScalar(rOut), _top, _ref, positions, colors);
+        pushTri(ctr, bnd[k].clone().multiplyScalar(rHi), bnd[(k + 1) % n].clone().multiplyScalar(rHi), _top, _ref, positions, colors);
     }
-    // grass blocks show brown (dirt) on their sides; else darken the material; AO fades wall bottoms.
-    // water sides stay PURE depth tint (no AO/gradient) so the shader can recover depth for its alpha.
+    // BOTTOM cap (faces down): a top slab floats over the cell's lower-half gap, so show its underside.
+    if (shape === SHAPE_SLAB_HI) {
+      _top.copy(COLORS[matn]).multiplyScalar(WALL_BASE_AO);
+      const ctr = col.center.clone().multiplyScalar(rLo);
+      _capRef.copy(col.center).multiplyScalar(rHi);                     // ref ABOVE the cap → normal points down
+      for (let k = 0; k < n; k++)
+        pushTri(ctr, bnd[k].clone().multiplyScalar(rLo), bnd[(k + 1) % n].clone().multiplyScalar(rLo), _top, _capRef, positions, colors);
+    }
+    // SIDE walls over the occupied band. grass shows brown (dirt) sides; water stays PURE depth tint
+    // (no AO/gradient) so the shader can recover depth for its alpha.
     if (matn === WATER_NUM) { _sideC.copy(_wcol); _sideBot.copy(_wcol); }
     else {
       _sideC.copy(matn === GRASS_NUM ? DIRT_COL : COLORS[matn]).multiplyScalar(0.82);
@@ -358,8 +373,8 @@ function emitColumn(col, s, sPos, sCol, wPos, wCol) {
     for (let k = 0; k < n; k++) {
       const nb = neigh[k];
       if (!(nb < 0 || s.getMat(nb, L) === AIR)) continue;
-      const aOut = bnd[k].clone().multiplyScalar(rOut), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rOut);
-      const aIn = bnd[k].clone().multiplyScalar(rIn), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rIn);
+      const aOut = bnd[k].clone().multiplyScalar(rHi), bOut = bnd[(k + 1) % n].clone().multiplyScalar(rHi);
+      const aIn = bnd[k].clone().multiplyScalar(rLo), bIn = bnd[(k + 1) % n].clone().multiplyScalar(rLo);
       pushTriC(aOut, bOut, bIn, _sideC, _sideC, _sideBot, _ref, positions, colors);   // top verts bright, bottom dark
       pushTriC(aOut, bIn, aIn, _sideC, _sideBot, _sideBot, _ref, positions, colors);
     }

@@ -22,7 +22,8 @@ import { buildHexSphere } from './hexsphere.js';
 import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin, terrainMeta } from './planet-mesh.js';
 import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
-  WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS } from '../../data/planet.js';
+  WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS,
+  SHAPES, SHAPE_MASK, SHAPE_FULL, SHAPE_SLAB_HI } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
 
@@ -51,7 +52,7 @@ export function mountEarth(task) {
   legend.innerHTML =
     '<b>Controls</b><br>Click — look around<br>W A S D — walk · Space — jump<br>' +
     'X — hover (fly) · Q / E — up / down<br>Click / F / R — use held item<br>' +
-    '1 block · 2 ⛏️ · 3 🪏 · 4 🪓<br>B — materials · C / V — cycle<br>M — world map · H — hide this';
+    '1 block · 2 ⛏️ · 3 🪏 · 4 🪓<br>B — materials · C / V — cycle · G — shape<br>M — world map · H — hide this';
   const overlay = el('div.earth-loading', { text: 'Generating planet…' });
   const mapEl = el('div.earth-map.hidden', {
     html: '<div class="earth-map-frame"><div class="earth-map-title">World Map · drag to spin · M / Esc to close</div></div>',
@@ -211,15 +212,16 @@ export function mountEarth(task) {
     const compatible = saved && saved.freq === FREQ && saved.layers === LAYERS && saved.tv === TERRAIN_VERSION;
     let seed = saved && saved.seed != null ? saved.seed : (Math.random() * 0x7fffffff) | 0;
     const edits = new Map();                               // cellIndex -> material num (0 = mined to air)
+    const editStates = new Map();                          // cellIndex -> per-block state (shape bits, Phase 2)
     if (compatible && Array.isArray(saved.edits)) {
-      for (const ed of saved.edits) if (ed && ed.c >= 0) edits.set(ed.c, ed.m);
+      for (const ed of saved.edits) if (ed && ed.c >= 0) { edits.set(ed.c, ed.m); if (ed.s) editStates.set(ed.c, ed.s); }
     }
     if (compatible && Array.isArray(saved.discovered)) for (const ci of saved.discovered) discovered.add(ci);
     if (compatible && Array.isArray(saved.discoveredLandmarks)) for (const id of saved.discoveredLandmarks) discoveredLandmarks.add(id);
     if (compatible && Number.isFinite(saved.waypoint) && saved.waypoint >= 0) waypoint = saved.waypoint;
     if (compatible && Number.isFinite(saved.laps)) laps = saved.laps;
     function persist() {
-      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered], discoveredLandmarks: [...discoveredLandmarks], waypoint: waypoint == null ? -1 : waypoint, laps });
+      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => { const s = editStates.get(c); return s ? { c, m, s } : { c, m }; }), discovered: [...discovered], discoveredLandmarks: [...discoveredLandmarks], waypoint: waypoint == null ? -1 : waypoint, laps });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
@@ -230,6 +232,8 @@ export function mountEarth(task) {
       // compact the transient flat grid into the per-chunk palette store (the resident representation);
       // the flat `cellsArr` is dropped after this — the worker keeps its own copy only until transfer.
       store = compactToStore(cols, cellsArr, chCount);
+      // re-apply saved per-block state (shapes) onto the store (material edits were already baked into cells)
+      for (const [ci, v] of editStates) store.setState((ci / LAYERS) | 0, ci % LAYERS, v);
       cx = new Float32Array(N); cy = new Float32Array(N); cz = new Float32Array(N);
       for (let i = 0; i < N; i++) { const c = columns[i].center; cx[i] = c.x; cy[i] = c.y; cz[i] = c.z; }
       // bucketed index: per-chunk column lists + centroids + neighbour scan sets
@@ -586,6 +590,7 @@ export function mountEarth(task) {
     // ---- creative state: you HOLD a block (place) or a tool (pickaxe/shovel/axe, gated mine) ----
     let held = 'block';                                   // 'block' | 'pickaxe' | 'shovel' | 'axe'
     let matIdx = MATERIALS.findIndex((m) => m.id === 'grass'); if (matIdx < 0) matIdx = 0;
+    let heldShape = SHAPE_FULL;                            // Phase 2: block shape to place (full / slabs)
     const matNum = () => matIdx + 1;                       // numeric id (0 = air)
     // which materials each tool can mine (water is never mineable). Names → numeric ids via MATERIAL_NUM.
     const _ids = (...names) => new Set(names.map((n) => MATERIAL_NUM[n]).filter(Boolean));
@@ -608,9 +613,12 @@ export function mountEarth(task) {
       for (const nb of columns[colId].neighbors) if (nb >= 0) s.add(columns[nb].chunk);
       return s;
     }
-    function applyEdit(colId, L, m) {
+    function applyEdit(colId, L, m, shape = SHAPE_FULL) {
       const ci = cellIndex(colId, L);
       store.setMat(colId, L, m); edits.set(ci, m);
+      // per-block shape state (Phase 2): only blocks carry it; mining (AIR) or a full block clears it
+      const st = (m === AIR ? 0 : (shape & SHAPE_MASK));
+      store.setState(colId, L, st); if (st) editStates.set(ci, st); else editStates.delete(ci);
       // re-mesh only affected chunks that are currently streamed-in; others have the store updated and
       // will mesh correctly when next activated.
       const affected = [...affectedChunks(colId)].filter((id) => activeSet.has(id));
@@ -623,7 +631,7 @@ export function mountEarth(task) {
     function doPlace() {
       if (!target || target.placeColId < 0) return;        // the air cell the ray last passed through
       if (store.getMat(target.placeColId, target.placeL) !== AIR) return;
-      applyEdit(target.placeColId, target.placeL, matNum());
+      applyEdit(target.placeColId, target.placeL, matNum(), heldShape);
     }
     function doMine() {
       if (!target) return;
@@ -653,8 +661,9 @@ export function mountEarth(task) {
       while (heldGroup.children.length) { const c = heldGroup.children.pop(); c.geometry.dispose(); c.material.dispose(); }
       if (held === 'block') {
         heldGroup.rotation.set(0.55, 0.6, 0);
-        const hx = vmMesh(new THREE.CylinderGeometry(0.1, 0.1, 0.13, 6), MATERIALS[matIdx].color, 0, 0, 0);   // a hexagonal prism (a hexel)
-        heldGroup.add(hx);
+        const full = heldShape === SHAPE_FULL, h = full ? 0.13 : 0.065;     // slabs are half-height
+        const yOff = full ? 0 : (heldShape === SHAPE_SLAB_HI ? 0.0325 : -0.0325);
+        heldGroup.add(vmMesh(new THREE.CylinderGeometry(0.1, 0.1, h, 6), MATERIALS[matIdx].color, 0, yOff, 0));   // hexagonal prism (a hexel / slab)
       } else {
         heldGroup.rotation.set(0.35, -0.4, 0.35);          // a "held" tilt; handle runs along local Y
         heldGroup.add(vmBox(0.022, 0.30, 0.022, _vmWood, 0, -0.02, 0));   // handle
@@ -664,9 +673,18 @@ export function mountEarth(task) {
       }
     }
     function selectHeld(h) { held = h; updateHeldModel(); refreshBelt(); drawHud(); }
+    const shapeOf = (id) => SHAPES.find((s) => s.id === id) || SHAPES[0];
+    function cycleShape() {                                 // G: full → slab → top slab (applies to placed blocks)
+      if (held !== 'block') held = 'block';
+      heldShape = SHAPES[(SHAPES.findIndex((s) => s.id === heldShape) + 1) % SHAPES.length].id;
+      updateHeldModel(); refreshBelt(); drawHud();
+      const sh = shapeOf(heldShape); showHint(`${sh.tag} ${sh.title}`);
+    }
 
     // ---- HUD + tool belt ----
-    const heldLabel = () => held === 'block' ? `${MATERIALS[matIdx].emoji} ${MATERIALS[matIdx].title}` : `${TOOL_META[held].emoji} ${TOOL_META[held].title}`;
+    const heldLabel = () => held === 'block'
+      ? `${MATERIALS[matIdx].emoji} ${MATERIALS[matIdx].title}${heldShape === SHAPE_FULL ? '' : ' ' + shapeOf(heldShape).tag}`
+      : `${TOOL_META[held].emoji} ${TOOL_META[held].title}`;
     function drawHud() {
       const mode = camMode === 'fly' ? '🚁 Hover' : camMode === 'walk' ? '🚶 Walk' : '🛰️ Orbit';
       hud.innerHTML =
@@ -692,6 +710,8 @@ export function mountEarth(task) {
           html: `<span class="sw" style="--sw:#${mm.color.toString(16).padStart(6, '0')}"></span> ${mm.emoji} ${mm.title} ▾`,
           title: 'Materials (B)', onclick: () => toggleMatPanel(),
         }),
+        el('button.tool-btn' + (held === 'block' && heldShape !== SHAPE_FULL ? '.active' : ''),
+          { text: `G ${shapeOf(heldShape).tag}`, title: 'Block shape (G) — full / slab / top slab', onclick: () => cycleShape() }),
       );
     }
     let matPanelOpen = false;
@@ -822,6 +842,7 @@ export function mountEarth(task) {
       if (k === 'f' || k === 'r') { doUse(); return; }      // use the held item (place block / mine with tool)
       if (k === 'c') { cycleMat(1); return; }
       if (k === 'v') { cycleMat(-1); return; }
+      if (k === 'g') { cycleShape(); return; }                // block shape: full / slab / top slab
       if (k === 't') { timeScale = timeScale === 1 ? 30 : 1; return; }   // fast-forward day/night
       if (k === '1') { selectHeld('block'); return; }
       if (k === '2') { selectHeld('pickaxe'); return; }
@@ -1129,8 +1150,11 @@ export function mountEarth(task) {
         get landmarks() { return landmarks.map((l) => ({ kind: l.kind, name: l.name, colId: l.colId, aboveSea: l.aboveSea, chunk: l.chunk })); },
         get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); },
         get waypoint() { return waypoint; }, get laps() { return laps; }, get lapSigned() { return +lapSigned.toFixed(3); },
-        get river() { return riverLandmark; },
-        setWaypoint(c) { waypoint = c; persist(); drawHud(); }, stepJourney() { updateJourney(); } };
+        get river() { return riverLandmark; }, get heldShape() { return heldShape; }, get states() { return store ? store.state.size : 0; },
+        setWaypoint(c) { waypoint = c; persist(); drawHud(); }, stepJourney() { updateJourney(); },
+        place(colId, L, m, shape) { applyEdit(colId, L, m, shape || 0); }, getState(colId, L) { return store.getState(colId, L); },
+        get playerCol() { return nearestColumn(anchor.x, anchor.y, anchor.z); }, topOf(colId) { return store.getTop(colId); },
+        get activeList() { return [...activeSet]; }, chunkOf(colId) { return columns[colId].chunk; } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
       if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand

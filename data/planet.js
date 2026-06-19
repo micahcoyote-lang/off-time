@@ -77,6 +77,17 @@ export const PLANET_TOOLS = [
   { id: 'mine',  title: 'Mine',  emoji: '⛏️' },
 ];
 
+// ---- block shapes (Phase 2 building depth) ----
+// A placed block's per-cell STATE (VoxelStore sparse map) stores a shape id in its low bits; 0 = a full
+// hexel (default, no state stored). Slabs fill half the cell's radial band. Append-only (ids persist in saves).
+export const SHAPE_FULL = 0, SHAPE_SLAB_LO = 1, SHAPE_SLAB_HI = 2;
+export const SHAPE_MASK = 0x7;            // low 3 bits = shape (rotation/light reserved for higher bits)
+export const SHAPES = [
+  { id: SHAPE_FULL,    title: 'Block',     tag: '⬢' },     // full hexel
+  { id: SHAPE_SLAB_LO, title: 'Slab',      tag: '▄' },     // bottom half
+  { id: SHAPE_SLAB_HI, title: 'Top Slab',  tag: '▀' },     // top half
+];
+
 export function getPlanetMaterial(id) {
   return MATERIALS.find((m) => m.id === id) || null;
 }
