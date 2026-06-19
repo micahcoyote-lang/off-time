@@ -8,14 +8,14 @@
    Protocol:
      main → worker : { type:'init', freq, seed, edits:[{c,m}] }
      worker → main : { type:'topology', centers, boundary, boundaryLen, neighbors, chunk, cells,
-                       chunkCount, pentagonCount }                     (one message, transferables)
+                       chunkCount, pentagonCount, river }              (one message, transferables)
                      { type:'chunk', chunkId, sPos, sCol, wPos, wCol, built, total }  (one per chunk)
                      { type:'done' }
 
    This is a MODULE worker (`{type:'module'}`), so it can `import` the same ES modules the page uses. */
 
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, meshSurfaceSkin } from './planet-mesh.js';
+import { terrainFill, meshSurfaceSkin, terrainMeta } from './planet-mesh.js';
 import { FREQ_COARSE } from '../../data/planet.js';
 
 self.onmessage = (e) => {
@@ -26,6 +26,7 @@ self.onmessage = (e) => {
   // 1. topology + terrain (+ saved edits) — the work that used to freeze the page, now off-thread
   const { columns, pentagonCount, chunkCount } = buildHexSphere(freq);
   const cells = terrainFill(columns, seed);
+  const river = terrainMeta.river;                  // capture before the coarse globe's terrainFill clears it
   if (Array.isArray(edits)) {
     for (const ed of edits) if (ed && ed.c >= 0 && ed.c < cells.length) cells[ed.c] = ed.m;
   }
@@ -53,7 +54,7 @@ self.onmessage = (e) => {
   // transfer the full cells grid (the main thread keeps it resident for picking + on-demand meshing).
   // Safe to transfer the original: the coarse globe below uses its OWN low-FREQ cells, not this one.
   self.postMessage(
-    { type: 'topology', centers, boundary, boundaryLen, neighbors, chunk, cells, chunkCount, pentagonCount },
+    { type: 'topology', centers, boundary, boundaryLen, neighbors, chunk, cells, chunkCount, pentagonCount, river },
     [centers.buffer, boundary.buffer, boundaryLen.buffer, neighbors.buffer, chunk.buffer, cells.buffer],
   );
 

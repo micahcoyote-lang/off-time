@@ -19,7 +19,7 @@ import * as THREE from '../../assets/vendor/three.module.js';
 import { el, topbar, go } from '../ui.js';
 import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin } from './planet-mesh.js';
+import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin, terrainMeta } from './planet-mesh.js';
 import { compactToStore } from './voxel-store.js';
 import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS } from '../../data/planet.js';
@@ -178,6 +178,7 @@ export function mountEarth(task) {
     // ---- landmarks (P1b): named peaks/water bodies you discover; in-world signposts + compass ----
     let landmarks = [], beacons = [];                    // registry + their in-world signpost meshes
     const discoveredLandmarks = new Set();               // landmark ids the player has visited (persisted)
+    let riverLandmark = null;                            // P1c: { colId, length } of the longest river (from terrainFill)
     // P1b-2: click-the-map waypoint (a flagged column) + circumnavigation tracking
     let waypoint = null;                                 // colId the player flagged on the map (null = none)
     let laps = 0, lapSigned = 0, lastLon = null;         // net signed longitude travel around the polar axis → laps
@@ -302,6 +303,8 @@ export function mountEarth(task) {
       }
       waters.sort((a, b) => b.size - a.size);
       if (waters[1] && waters[1].size > 30) landmarks.push(mk('water', 'Great Lake', waters[1].col));
+      // RIVER: the longest downhill channel traced in terrainFill (P1c), named at its midpoint
+      if (riverLandmark && riverLandmark.colId >= 0 && riverLandmark.colId < N) landmarks.push(mk('river', 'Long River', riverLandmark.colId));
       // in-world signposts (a modest post + sign board, not a glowing tower)
       for (const lm of landmarks) { const sp = makeSignpost(lm.kind); sp.position.copy(lm.center).multiplyScalar(lm.radius); sp.quaternion.setFromUnitVectors(UP_Y, lm.center); sp.frustumCulled = false; scene.add(sp); beacons.push(sp); }
     }
@@ -310,7 +313,7 @@ export function mountEarth(task) {
     function makeSignpost(kind) {
       const g = new THREE.Group();
       g.add(spBox(0.07, 1.4, 0.07, 0x6b4a2e, 0.7));        // post rises along local +Y from the surface
-      g.add(spBox(0.62, 0.34, 0.05, kind === 'water' ? 0x3f9fc4 : 0xd8a93a, 1.18));   // sign board near the top
+      g.add(spBox(0.62, 0.34, 0.05, kind === 'water' ? 0x3f9fc4 : kind === 'river' ? 0x49c2e0 : 0xd8a93a, 1.18));   // sign board near the top
       return g;
     }
     // worker `topology` message → reconstruct lightweight column objects, then set up the world.
@@ -326,6 +329,7 @@ export function mountEarth(task) {
         }
         cols[i] = { id: i, center: new THREE.Vector3(d.centers[i * 3], d.centers[i * 3 + 1], d.centers[i * 3 + 2]), boundary, neighbors: neigh, chunk: d.chunk[i], isPentagon: bl === 5 };
       }
+      riverLandmark = d.river || null;
       setupWorld(cols, d.cells, d.pentagonCount, d.chunkCount);
     }
 
@@ -404,7 +408,7 @@ export function mountEarth(task) {
       mapCam = new THREE.PerspectiveCamera(40, 1, R * 0.05, R * 8);
       const mk = (h) => { const m = new THREE.Mesh(new THREE.ConeGeometry(R * 0.03, R * 0.13, 8), new THREE.MeshBasicMaterial({ color: h })); m.frustumCulled = false; return m; };
       mapMarkPlayer = mk(0x4ade80); mapScene.add(mapMarkPlayer);
-      mapMarks = landmarks.map((lm) => { const m = mk(lm.kind === 'water' ? 0x3f9fc4 : 0xffd34d); mapScene.add(m); return m; });
+      mapMarks = landmarks.map((lm) => { const m = mk(lm.kind === 'water' ? 0x3f9fc4 : lm.kind === 'river' ? 0x49c2e0 : 0xffd34d); mapScene.add(m); return m; });
       mapMarkWp = mk(0xff4dd2); mapMarkWp.scale.set(1.15, 1.4, 1.15); mapScene.add(mapMarkWp);   // waypoint (magenta, taller)
     }
     const _msph = new THREE.Spherical(), _mup = new THREE.Vector3(0, 1, 0);
@@ -468,7 +472,7 @@ export function mountEarth(task) {
         if (!discoveredLandmarks.has(lm.id)) continue;
         const rel = wrapPi(bearingOf(lm.center) - heading); if (Math.abs(rel) >= HALF_FOV) continue;
         const dist = Math.round(Math.acos(Math.max(-1, Math.min(1, anchor.dot(lm.center)))) * R);
-        html += tick(rel, `${lm.kind === 'water' ? '💧' : '🏔️'} ${dist}m`, 'cmp-lm');
+        html += tick(rel, `${lm.kind === 'water' ? '💧' : lm.kind === 'river' ? '🏞️' : '🏔️'} ${dist}m`, 'cmp-lm');
       }
       if (waypoint != null) {                                       // the player's flagged destination
         const wdir = columns[waypoint].center, rel = wrapPi(bearingOf(wdir) - heading);
@@ -1125,6 +1129,7 @@ export function mountEarth(task) {
         get landmarks() { return landmarks.map((l) => ({ kind: l.kind, name: l.name, colId: l.colId, aboveSea: l.aboveSea, chunk: l.chunk })); },
         get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); },
         get waypoint() { return waypoint; }, get laps() { return laps; }, get lapSigned() { return +lapSigned.toFixed(3); },
+        get river() { return riverLandmark; },
         setWaypoint(c) { waypoint = c; persist(); drawHud(); }, stepJourney() { updateJourney(); } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
@@ -1134,6 +1139,7 @@ export function mountEarth(task) {
     function runFallback() {                               // no Worker: generate on the main thread (E1 path)
       const topo = buildHexSphere(FREQ);
       const localCells = terrainFill(topo.columns, seed);
+      riverLandmark = terrainMeta.river || null;          // capture before the coarse terrainFill below clears it
       for (const [c, m] of edits) if (c >= 0 && c < localCells.length) localCells[c] = m;
       setupWorld(topo.columns, localCells, topo.pentagonCount, topo.chunkCount);
       const cg = buildHexSphere(FREQ_COARSE), ccells = terrainFill(cg.columns, seed);   // coarse LOD globe (per chunk)
