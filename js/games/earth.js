@@ -21,7 +21,7 @@ import { state, markTaskDone } from '../state.js';
 import { buildHexSphere } from './hexsphere.js';
 import { terrainFill, buildPlanetChunks, cellIndex, AIR, MATERIAL_NUM, meshSurfaceSkin } from './planet-mesh.js';
 import { compactToStore } from './voxel-store.js';
-import { FREQ, LAYERS, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
+import { FREQ, LAYERS, TERRAIN_VERSION, SEA_L, MATERIALS, R, MAX_R, TH, radius, DAY_SECONDS, ATM_COLOR,
   WADE_MAX, BODY_SUBMERGE, SWIM_FACTOR, FREQ_COARSE, STREAM_MARGIN, MAX_ACTIVE_CHUNKS } from '../../data/planet.js';
 
 const WATER = MATERIAL_NUM.water;   // numeric id of the water material (liquid: not mineable, you swim in it)
@@ -197,7 +197,7 @@ export function mountEarth(task) {
 
     // ---- saved seed + edits (size-guarded). The worker regenerates from `seed` and applies `edits`. ----
     const saved = state.get('builds.earth', null);
-    const compatible = saved && saved.freq === FREQ && saved.layers === LAYERS;
+    const compatible = saved && saved.freq === FREQ && saved.layers === LAYERS && saved.tv === TERRAIN_VERSION;
     let seed = saved && saved.seed != null ? saved.seed : (Math.random() * 0x7fffffff) | 0;
     const edits = new Map();                               // cellIndex -> material num (0 = mined to air)
     if (compatible && Array.isArray(saved.edits)) {
@@ -205,7 +205,7 @@ export function mountEarth(task) {
     }
     if (compatible && Array.isArray(saved.discovered)) for (const ci of saved.discovered) discovered.add(ci);
     function persist() {
-      state.set('builds.earth', { v: 2, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered] });
+      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered] });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 

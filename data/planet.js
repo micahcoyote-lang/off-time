@@ -4,6 +4,7 @@
 
 export const FREQ = 290;      // icosphere subdivision frequency → 10·FREQ²+2 = 841,002 columns (E4: ~4× bigger)
 export const LAYERS = 128;    // radial voxel shells per column (build ceiling) — E4: 4× deeper for very tall mountains + deep digging
+export const TERRAIN_VERSION = 2;  // bump when terrainFill output changes → the save guard discards edits placed against the old world
 export const CORE_L = 4;      // solid core boundary layer (below this is always solid core)
 export const SEA_L = 12;      // default sea level layer
 
@@ -56,7 +57,19 @@ export const MATERIALS = [
   { id: 'tundra',  title: 'Tundra',  emoji: '🧊', color: 0x9aa890, kind: 'terrain' },
   // innermost band: the dark/hot core you reach by mining all the way down (appended → id stays stable)
   { id: 'core',    title: 'Core',    emoji: '🌋', color: 0x5a2e22, kind: 'terrain' },
-  { id: 'leaves',  title: 'Leaves',  emoji: '🍃', color: 0x4a9d3a, kind: 'block' },   // tree canopy
+  { id: 'leaves',  title: 'Leaves',  emoji: '🍃', color: 0x4a9d3a, kind: 'block' },   // tree canopy (broadleaf)
+  // rock/mineral variety so mountains + strata read as "made of lots of things" (vertex-colored, no textures)
+  { id: 'granite',   title: 'Granite',   emoji: '🪨', color: 0x9a8f80, kind: 'terrain' },   // warm light grey
+  { id: 'basalt',    title: 'Basalt',    emoji: '⬛', color: 0x35353c, kind: 'terrain' },   // near-black volcanic
+  { id: 'slate',     title: 'Slate',     emoji: '🔘', color: 0x566270, kind: 'terrain' },   // blue-grey
+  { id: 'sandstone', title: 'Sandstone', emoji: '🟧', color: 0xc89b66, kind: 'terrain' },   // tan sedimentary
+  { id: 'redrock',   title: 'Red Rock',  emoji: '🟥', color: 0x9c4a32, kind: 'terrain' },   // rust mesa/badlands
+  { id: 'scree',     title: 'Scree',     emoji: '🪙', color: 0x7d756a, kind: 'terrain' },   // grey-brown gravel slope
+  { id: 'ice',       title: 'Ice',       emoji: '🧊', color: 0xcfeaf5, kind: 'terrain' },   // pale blue glacier
+  // extra biome surfaces + foliage
+  { id: 'jungle',    title: 'Jungle',    emoji: '🌴', color: 0x2f6b25, kind: 'terrain' },   // hot + very wet
+  { id: 'taiga',     title: 'Taiga',     emoji: '🌲', color: 0x3f5d4a, kind: 'terrain' },   // cold boreal
+  { id: 'pineleaf',  title: 'Pine',      emoji: '🌲', color: 0x2c5a3a, kind: 'block' },     // conifer canopy (darker)
 ];
 
 export const PLANET_TOOLS = [

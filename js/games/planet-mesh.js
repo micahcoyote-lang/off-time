@@ -64,8 +64,11 @@ export function terrainFill(columns, seed) {
   // RF = high-freq ridge detail, MTN_AMP = peak height in layers (tuned so the rare tallest peak nears
   // LAYERS−1 ≈ 127), MTN_E = land-elevation threshold below which no mountains grow (plains stay flat).
   const MF = 0.55, RF = 3.1, MTN_AMP = 170, MTN_E = 0.35;
+  const GF = 0.42, RUF = 1.05, ROUGH_AMP = 7;    // geology / ruggedness freqs + crag amplitude
+  // a region's bedrock from a low-freq geology sample → neighbouring ranges are visibly different rock
+  const bedrockOf = (g) => g < 0.34 ? NUM.stone : g < 0.52 ? NUM.granite : g < 0.68 ? NUM.slate : g < 0.84 ? NUM.basalt : NUM.sandstone;
 
-  // ---- pass 1: heightmap + climate biome + layered strata (grass/biome → dirt → rock → core) ----
+  // ---- pass 1: heightmap + 3D-noise crags + climate biome + varied rock surfacing + banded strata ----
   for (const col of columns) {
     const c = col.center;
     // continents: a broad low-frequency mask makes a few big landmasses, plus finer detail
@@ -77,14 +80,15 @@ export function terrainFill(columns, seed) {
     if (e < 0) e *= 1.8;                                    // steepen below sea level → real deep basins + shallow shelves
     let s = Math.round(SEA_L + e * AMP);
     if (e > MTN_E) {                                        // mountain belts: tall ridged ranges only on high land (plains untouched)
-      // smoothstep the low-freq mask across this fBm's realistic range (it clusters near 0.5) → belts
-      // spike highest; the 0.4 floor lets all high land rise some. (Plains stay flat via the e>MTN_E gate.)
       const mf = fbm(c.x * MF - 5.2, c.y * MF + 13.7, c.z * MF - 2.4);
-      const mt = Math.max(0, Math.min(1, (mf - 0.46) / 0.18)); const mask = 0.4 + 0.6 * mt * mt * (3 - 2 * mt);   // 0.4..1: belts spike most, but all high land rises
-      const ridge = 1 - Math.abs(2 * fbm(c.x * RF + 4.6, c.y * RF - 8.1, c.z * RF + 17.2) - 1);       // 0..1, sharp ridgelines
-      const land = Math.max(0, Math.min(1, (e - MTN_E) / 0.55));   // ramp over high land (e tops out ≈0.96, so 0.55 reaches ~1 on the highest continents)
-      s += Math.round(mask * ridge * land * MTN_AMP);      // tallest where all three align; clamp below catches the rare overshoot
+      const mt = Math.max(0, Math.min(1, (mf - 0.46) / 0.18)); const mask = 0.4 + 0.6 * mt * mt * (3 - 2 * mt);   // 0.4..1
+      const ridge = 1 - Math.abs(2 * fbm(c.x * RF + 4.6, c.y * RF - 8.1, c.z * RF + 17.2) - 1);       // sharp ridgelines
+      const land = Math.max(0, Math.min(1, (e - MTN_E) / 0.55));
+      s += Math.round(mask * ridge * land * MTN_AMP);
     }
+    // 3D-noise ruggedness: crags/cliffs that grow with elevation (plains stay smooth)
+    const rough = (fbm(c.x * RUF + 21.0, c.y * RUF - 7.5, c.z * RUF + 3.3) - 0.5) * 2;   // −1..1
+    s += Math.round(rough * Math.min(1, Math.max(0, s - SEA_L) / 30) * ROUGH_AMP);
     s = Math.max(CORE_L + 1, Math.min(LAYERS - 1, s));
     surf[col.id] = s;
     const base = col.id * LAYERS;
@@ -94,22 +98,38 @@ export function terrainFill(columns, seed) {
     const jit = (fbm(c.x * 9.0 - 1.3, c.y * 9.0 + 4.4, c.z * 9.0 - 8.8) - 0.5) * 0.12;
     const temp = Math.max(0, Math.min(1, (1 - lat * 1.15) - elevAbove * 0.045 + jit));
     const hum = Math.max(0, Math.min(1, fbm(c.x * HF - 7.1, c.y * HF + 19.3, c.z * HF - 3.7) + jit));
+    const geo = fbm(c.x * GF + 40.0, c.y * GF - 15.0, c.z * GF + 9.0);   // region geology → bedrock type
+    const bedrock = bedrockOf(geo);
+
     let topMat;
     if (s <= SEA_L + 1) topMat = NUM.sand;                 // shoreline / shallow seabed
-    else if (elevAbove > 6) topMat = temp < 0.35 ? NUM.snow : NUM.rock;  // peaks: snowcap if cold, else rock
-    else if (temp < 0.20) topMat = NUM.snow;              // frigid
-    else if (temp < 0.40) topMat = NUM.tundra;            // cold
-    else if (temp > 0.70 && hum < 0.40) topMat = NUM.sand;    // hot + dry → desert
-    else if (temp > 0.50 && hum < 0.50) topMat = NUM.savanna; // warm + semi-dry
-    else if (hum > 0.62) topMat = NUM.forest;            // wet → forest
-    else topMat = NUM.grass;                             // temperate
+    else if (elevAbove > 22) {                             // exposed mountain: scree → varied bedrock → snow → ice
+      const snowLine = 48 + temp * 46;                     // snow line rises with warmth (cold poles snow low)
+      if (elevAbove > snowLine + 16) topMat = NUM.ice;     // extreme high → glacier ice
+      else if (elevAbove > snowLine) topMat = NUM.snow;    // cold high → snow
+      else topMat = elevAbove < 34 ? NUM.scree : bedrock;  // lower slope scree → exposed region bedrock higher
+    }
+    else if (temp < 0.18) topMat = NUM.snow;               // frigid lowland
+    else if (temp < 0.34) topMat = hum > 0.5 ? NUM.taiga : NUM.tundra;   // cold: wet boreal vs dry tundra
+    else if (temp > 0.72 && hum < 0.26) topMat = NUM.sand;     // very hot + dry → desert
+    else if (temp > 0.58 && hum < 0.42 && elevAbove > 3) topMat = NUM.redrock;  // hot dry uplands → mesa / badlands
+    else if (temp > 0.62 && hum > 0.60) topMat = NUM.jungle;   // hot + wet → jungle (before forest)
+    else if (temp > 0.5 && hum < 0.5) topMat = NUM.savanna;    // warm + semi-dry
+    else if (hum > 0.58) topMat = NUM.forest;            // wet → forest
+    else topMat = NUM.grass;                              // temperate
 
-    // strata bands: surface biome on top, a dirt subsoil, the broad rock layer, then the solid core
+    // strata: biome top, dirt subsoil, then near-horizontal BANDED bedrock, core. Bands cycle
+    // bedrock → stone → contrast every ~1.6 layers, phase-shifted per region (cheap: no per-cell noise).
+    const band2 = bedrock === NUM.stone ? NUM.granite : NUM.stone;
+    const strataPhase = (geo + detail) * 6.0;
     for (let L = 0; L <= s; L++) {
-      cells[base + L] = L === s ? topMat
-        : L >= s - 3 ? NUM.dirt
-          : L <= CORE_L ? NUM.core
-            : NUM.stone;
+      if (L === s) cells[base + L] = topMat;
+      else if (L >= s - 2) cells[base + L] = NUM.dirt;
+      else if (L <= CORE_L) cells[base + L] = NUM.core;
+      else {
+        const bi = ((Math.floor(L * 0.62 + strataPhase) % 3) + 3) % 3;
+        cells[base + L] = bi === 0 ? bedrock : bi === 1 ? NUM.stone : band2;
+      }
     }
     if (s < SEA_L) {                                       // flood low columns up to sea level
       for (let L = s + 1; L <= SEA_L; L++) cells[base + L] = NUM.water;
@@ -132,32 +152,61 @@ export function terrainFill(columns, seed) {
     }
   }
 
-  // ---- pass 3: structures — stamp trees on the surface, density by biome (deterministic per seed) ----
-  // A tree = a `wood` trunk + a `leaves` cap, with a 1-ring leaf canopy spilling into neighbour columns'
-  // air. Tall trunks keep canopies above head height so you can walk under them; trunks are solid (walk
-  // obstacle + mineable). Peaks grow no trees (rock/snow biomes), so the tallest-peak beacon is unaffected.
-  const WOOD = NUM.wood, LEAF = NUM.leaves;
+  // ---- pass 3: structures — taller, shaped trees typed by biome (deterministic per seed) ----
+  // Each tree = a tall `wood` trunk + a MULTI-LAYER canopy whose per-layer radius gives a real
+  // silhouette: rounded broadleaf, conical pine, high-canopy jungle giant, flat-topped acacia. Canopies
+  // spill into neighbour columns' AIR via a small k-ring BFS (radius ≤2); terrain clips them naturally
+  // (air-only writes). Trunks stay solid (walk obstacle + mineable); canopies sit above head height.
+  const WOOD = NUM.wood, LEAF = NUM.leaves, PINE = NUM.pineleaf;
   const thash = (i) => { let h = Math.imul((seed ^ i) >>> 0, 2246822519); h ^= h >>> 13; h = Math.imul(h, 3266489917); h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+  // columns within ring radius R of `col` → Map(colId → ring distance 0..R) (BFS over neighbours)
+  function ringDist(col, R) {
+    const seen = new Map([[col.id, 0]]); let frontier = [col];
+    for (let d = 1; d <= R; d++) {
+      const next = [];
+      for (const cc of frontier) for (const nb of cc.neighbors) if (nb >= 0 && !seen.has(nb)) { seen.set(nb, d); next.push(columns[nb]); }
+      frontier = next;
+    }
+    return seen;
+  }
+  // fill one leaf layer at absolute L over columns within ring radius r (air-only)
+  function leafLayer(rings, L, r, mat) {
+    if (L < 0 || L >= LAYERS) return;
+    for (const [cid, d] of rings) if (d <= r) { const i = cid * LAYERS + L; if (cells[i] === AIR) cells[i] = mat; }
+  }
   for (const col of columns) {
     const s = surf[col.id];
     if (s <= SEA_L) continue;                              // land above sea only
     const base = col.id * LAYERS, topM = cells[base + s];
-    let density;
-    if (topM === NUM.forest) density = 0.32;               // forest — dense
-    else if (topM === NUM.grass) density = 0.10;           // grass — scattered
-    else if (topM === NUM.savanna) density = 0.05;         // savanna — sparse
-    else continue;                                         // none on sand/snow/tundra/rock/peaks
+    let type, density;
+    if (topM === NUM.forest) { type = 'broadleaf'; density = 0.22; }
+    else if (topM === NUM.grass) { type = 'broadleaf'; density = 0.06; }   // scattered
+    else if (topM === NUM.jungle) { type = 'jungle'; density = 0.30; }
+    else if (topM === NUM.taiga) { type = 'pine'; density = 0.26; }
+    else if (topM === NUM.savanna) { type = 'acacia'; density = 0.04; }    // sparse
+    else continue;                                         // none on sand/snow/tundra/mesa/rock/peaks
     if (thash(col.id) > density) continue;
-    const trunkH = 5 + (thash(col.id + 7919) < 0.5 ? 0 : 2);     // 5 or 7 tall (canopy above head)
-    for (let L = s + 1; L <= s + trunkH && L < LAYERS; L++) if (cells[base + L] === AIR) cells[base + L] = WOOD;
-    const cap = Math.min(LAYERS - 1, s + trunkH);          // leaf cap + a 1-ring canopy into neighbours' air
-    for (let L = cap - 1; L <= cap + 1 && L < LAYERS; L++) {
-      if (L >= 0 && cells[base + L] === AIR) cells[base + L] = LEAF;
-      const neigh = col.neighbors;
-      for (let k = 0; k < neigh.length; k++) {
-        const nb = neigh[k];
-        if (nb >= 0 && L >= 0 && cells[nb * LAYERS + L] === AIR) cells[nb * LAYERS + L] = LEAF;
+    const rnd = thash(col.id + 7919);
+    let trunkH;
+    if (type === 'pine') trunkH = 9 + ((rnd * 6) | 0);        // 9..14 tall conifer
+    else if (type === 'jungle') trunkH = 12 + ((rnd * 7) | 0); // 12..18 giant
+    else if (type === 'acacia') trunkH = 8 + ((rnd * 5) | 0);  // 8..12 bare-trunk umbrella
+    else trunkH = 6 + ((rnd * 5) | 0);                         // 6..10 broadleaf
+    const top = s + trunkH;
+    for (let L = s + 1; L <= top && L < LAYERS; L++) if (cells[base + L] === AIR) cells[base + L] = WOOD;
+    const rings = ringDist(col, 2);
+    if (type === 'pine') {                                   // conical: wide-low → point-top, leaves start low
+      for (let L = s + 4; L <= top + 1; L++) {
+        const t = (L - (s + 4)) / Math.max(1, (top + 1) - (s + 4));    // 0 bottom → 1 top
+        leafLayer(rings, L, Math.round(2 * (1 - t)), PINE);           // radius 2 → 0
       }
+    } else if (type === 'jungle') {                         // tall bare trunk, broad crown only at the top
+      for (let L = top - 3; L <= top + 1; L++) leafLayer(rings, L, L >= top ? 1 : 2, LEAF);
+    } else if (type === 'acacia') {                         // flat umbrella on a bare trunk
+      leafLayer(rings, top, 2, LEAF); leafLayer(rings, top + 1, 1, LEAF);
+    } else {                                                // broadleaf: rounded blob
+      leafLayer(rings, top - 2, 1, LEAF); leafLayer(rings, top - 1, 2, LEAF);
+      leafLayer(rings, top, 2, LEAF); leafLayer(rings, top + 1, 1, LEAF); leafLayer(rings, top + 2, 1, LEAF);
     }
   }
   return cells;
