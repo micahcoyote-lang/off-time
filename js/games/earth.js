@@ -335,8 +335,7 @@ export function mountEarth(task) {
       }
       waters.sort((a, b) => b.size - a.size);
       if (waters[1] && waters[1].size > 30) landmarks.push(mk('water', 'Great Lake', waters[1].col));
-      // RIVER: the longest downhill channel traced in terrainFill (P1c), named at its midpoint
-      if (riverLandmark && riverLandmark.colId >= 0 && riverLandmark.colId < N) landmarks.push(mk('river', 'Long River', riverLandmark.colId));
+      // (rivers removed — no "Long River" landmark)
       // in-world signposts (a modest post + sign board, not a glowing tower)
       for (const lm of landmarks) { const sp = makeSignpost(lm.kind); sp.position.copy(lm.center).multiplyScalar(lm.radius); sp.quaternion.setFromUnitVectors(UP_Y, lm.center); sp.frustumCulled = false; scene.add(sp); beacons.push(sp); }
     }

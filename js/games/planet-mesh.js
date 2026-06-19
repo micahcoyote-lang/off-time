@@ -224,59 +224,9 @@ export function terrainFill(columns, seed) {
     }
   }
 
-  // ---- pass 4: rivers (P1c) — proper drainage hydrology, bounded & deterministic from `surf` + seed.
-  // (1) PRIORITY-FLOOD from the sea fills depressions and builds a drainage tree (`downstream[]`), so
-  // every land column has a monotonic path to the ocean — no pits to trap a trace, no basin-snaking.
-  // (2) FLOW ACCUMULATION pushes each column's unit of flow downstream. (3) CARVE shallow channels where
-  // flow exceeds a threshold (main stems, not every trickle). (4) record the longest stem as a landmark.
-  // Full-res world only (the coarse globe is too blocky to carve sensibly).
+  // (rivers removed — the user found them annoying; `terrainMeta.river` stays null so the landmark/compass
+  // plumbing simply never registers a "Long River". The drainage-hydrology pass lives in git history if wanted.)
   terrainMeta.river = null;
-  if (columns.length > 100000) {
-    const WATER = NUM.water, RIVER_DEPTH = 2, ACCUM = 300;  // ACCUM = upstream columns needed to be a "river"
-    const N = columns.length;
-    const filled = Int16Array.from(surf);                  // depression-filled heightmap (spill levels)
-    const downstream = new Int32Array(N).fill(-1);          // each land column drains toward this neighbour
-    const done = new Uint8Array(N);
-    const order = new Int32Array(N); let on = 0;            // columns in ascending pop (= spill) order
-    // binary min-heap of column ids keyed by filled[]
-    const heap = new Int32Array(N); let hn = 0;
-    const hpush = (id) => { heap[hn] = id; let i = hn++; while (i > 0) { const p = (i - 1) >> 1; if (filled[heap[p]] <= filled[heap[i]]) break; const t = heap[p]; heap[p] = heap[i]; heap[i] = t; i = p; } };
-    const hpop = () => { const top = heap[0]; heap[0] = heap[--hn]; let i = 0; for (;;) { let l = 2 * i + 1, r = l + 1, s = i; if (l < hn && filled[heap[l]] < filled[heap[s]]) s = l; if (r < hn && filled[heap[r]] < filled[heap[s]]) s = r; if (s === i) break; const t = heap[s]; heap[s] = heap[i]; heap[i] = t; i = s; } return top; };
-    for (let i = 0; i < N; i++) if (surf[i] <= SEA_L) { done[i] = 1; hpush(i); }   // outlets: every sea column
-    while (hn) {
-      const id = hpop(); order[on++] = id;
-      const nbs = columns[id].neighbors;
-      for (let k = 0; k < nbs.length; k++) { const nb = nbs[k];
-        if (nb < 0 || done[nb]) continue;
-        if (filled[id] > filled[nb]) filled[nb] = filled[id];   // raise a pit to its spill level
-        downstream[nb] = id; done[nb] = 1; hpush(nb);
-      }
-    }
-    // flow accumulation: process high→low (reverse pop order) so a column's flow reaches its outlet
-    const acc = new Float32Array(N).fill(1);
-    for (let i = on - 1; i >= 0; i--) { const id = order[i], d = downstream[id]; if (d >= 0) acc[d] += acc[id]; }
-    // carve channels along above-sea high-flow columns
-    const onRiver = new Uint8Array(N);
-    for (let id = 0; id < N; id++) {
-      if (surf[id] <= SEA_L || acc[id] < ACCUM) continue;
-      onRiver[id] = 1;
-      const s = surf[id], base = id * LAYERS, floor = Math.max(CORE_L + 1, s - RIVER_DEPTH);
-      let top = s; while (top + 1 < LAYERS && cells[base + top + 1] !== AIR) top++;   // include any tree trunk grown here
-      for (let L = floor + 2; L <= top; L++) cells[base + L] = AIR;   // hollow the banks (and clear a trunk) above the water
-      cells[base + floor + 1] = WATER;                              // one water layer in the bed
-    }
-    // longest river = longest downstream chain of river columns (start only at river headwaters)
-    const hasRiverUp = new Uint8Array(N);
-    for (let id = 0; id < N; id++) if (onRiver[id]) { const d = downstream[id]; if (d >= 0 && onRiver[d]) hasRiverUp[d] = 1; }
-    let longest = null, longestLen = 0;
-    for (let id = 0; id < N; id++) {
-      if (!onRiver[id] || hasRiverUp[id]) continue;
-      const chain = []; let cur = id, guard = 0;
-      while (cur >= 0 && onRiver[cur] && guard++ < 20000) { chain.push(cur); cur = downstream[cur]; }
-      if (chain.length > longestLen) { longestLen = chain.length; longest = chain; }
-    }
-    if (longest && longestLen >= 20) terrainMeta.river = { colId: longest[Math.floor(longest.length * 0.4)], length: longestLen };
-  }
   return cells;
 }
 
