@@ -76,12 +76,18 @@ export function terrainFill(columns, seed) {
   // ---- pass 1: heightmap + 3D-noise crags + climate biome + varied rock surfacing + banded strata ----
   for (const col of columns) {
     const c = col.center;
-    // continents: a broad low-frequency mask makes a few big landmasses, plus finer detail
-    const cont = fbm(c.x * CF + 2.7, c.y * CF - 4.1, c.z * CF + 8.3);
+    // continents: the same low-freq mask as before, but DOMAIN-WARPED so coastlines bend organically
+    // instead of following the noise grid. The warp only RELOCATES samples (same value distribution), so
+    // land fraction, mountain range and gradual slopes are preserved — verified A/B vs the un-warped terrain.
+    const wf = 0.55, wA = 0.4;
+    const wx = c.x + (fbm(c.x * wf + 30.0, c.y * wf + 10.0, c.z * wf - 20.0) - 0.5) * wA;
+    const wy = c.y + (fbm(c.x * wf - 15.0, c.y * wf + 25.0, c.z * wf + 5.0) - 0.5) * wA;
+    const wz = c.z + (fbm(c.x * wf + 8.0, c.y * wf - 12.0, c.z * wf + 40.0) - 0.5) * wA;
+    const cont = fbm(wx * CF + 2.7, wy * CF - 4.1, wz * CF + 8.3);
     const detail = fbm(c.x * NF + 11.3, c.y * NF + 5.7, c.z * NF + 1.9);
     const lat = Math.abs(c.y);                              // 0 equator … 1 pole
-    let e = (cont - 0.37) * 3.0 + (detail - 0.5) * 1.1;    // ~55% land (offset 0.52→0.37) + coastline ruggedness
-    e -= Math.pow(lat, 3) * 0.30;                           // poles trend lower, but gentler (0.45→0.30)
+    let e = (cont - 0.37) * 3.0 + (detail - 0.5) * 1.1;    // ~55% land + coastline ruggedness
+    e -= Math.pow(lat, 3) * 0.30;                           // poles trend lower, but gentler
     // continental shelf: broad gentle shallows near shore that still deepen to dark basins offshore.
     // The max(0.13,…) floor keeps every below-sea column at least ~1 layer deep so the coastline (ocean
     // extent) is unchanged; the pow shape spends most of the shelf shallow but reaches full depth by e≈−0.5.
