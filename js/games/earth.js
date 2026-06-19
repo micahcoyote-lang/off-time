@@ -178,10 +178,13 @@ export function mountEarth(task) {
     // ---- landmarks (P1b): named peaks/water bodies you discover; in-world signposts + compass ----
     let landmarks = [], beacons = [];                    // registry + their in-world signpost meshes
     const discoveredLandmarks = new Set();               // landmark ids the player has visited (persisted)
+    // P1b-2: click-the-map waypoint (a flagged column) + circumnavigation tracking
+    let waypoint = null;                                 // colId the player flagged on the map (null = none)
+    let laps = 0, lapSigned = 0, lastLon = null;         // net signed longitude travel around the polar axis → laps
 
     // ---- world map (P1a): a rotatable biome mini-globe + discovery fog ----
     let mapMesh = null, mapBaseCol = null, mapCol = null, mapChunkVtx = null, mapDirty = false;  // merged coarse globe
-    let mapScene = null, mapCam = null, mapMarkPlayer = null, mapMarks = [];
+    let mapScene = null, mapCam = null, mapMarkPlayer = null, mapMarks = [], mapMarkWp = null;
     let mapOpen = false, mapTheta = 0.6, mapPhi = 1.05, fogInited = false;
     const discovered = new Set();                         // chunk ids the player has visited
     let discoNew = 0;                                     // new regions since last persist (save throttle)
@@ -212,8 +215,10 @@ export function mountEarth(task) {
     }
     if (compatible && Array.isArray(saved.discovered)) for (const ci of saved.discovered) discovered.add(ci);
     if (compatible && Array.isArray(saved.discoveredLandmarks)) for (const id of saved.discoveredLandmarks) discoveredLandmarks.add(id);
+    if (compatible && Number.isFinite(saved.waypoint) && saved.waypoint >= 0) waypoint = saved.waypoint;
+    if (compatible && Number.isFinite(saved.laps)) laps = saved.laps;
     function persist() {
-      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered], discoveredLandmarks: [...discoveredLandmarks] });
+      state.set('builds.earth', { v: 2, tv: TERRAIN_VERSION, freq: FREQ, layers: LAYERS, seed, edits: [...edits].map(([c, m]) => ({ c, m })), discovered: [...discovered], discoveredLandmarks: [...discoveredLandmarks], waypoint: waypoint == null ? -1 : waypoint, laps });
     }
     persist();                                            // lock seed/size (and migrate stale saves)
 
@@ -400,6 +405,7 @@ export function mountEarth(task) {
       const mk = (h) => { const m = new THREE.Mesh(new THREE.ConeGeometry(R * 0.03, R * 0.13, 8), new THREE.MeshBasicMaterial({ color: h })); m.frustumCulled = false; return m; };
       mapMarkPlayer = mk(0x4ade80); mapScene.add(mapMarkPlayer);
       mapMarks = landmarks.map((lm) => { const m = mk(lm.kind === 'water' ? 0x3f9fc4 : 0xffd34d); mapScene.add(m); return m; });
+      mapMarkWp = mk(0xff4dd2); mapMarkWp.scale.set(1.15, 1.4, 1.15); mapScene.add(mapMarkWp);   // waypoint (magenta, taller)
     }
     const _msph = new THREE.Spherical(), _mup = new THREE.Vector3(0, 1, 0);
     function placeMapCamera() {
@@ -417,6 +423,26 @@ export function mountEarth(task) {
       const pdir = camMode === 'orbit' ? _mpd.copy(camera.position).normalize() : anchor;
       placeRadialMarker(mapMarkPlayer, pdir, true);
       for (let i = 0; i < landmarks.length; i++) if (mapMarks[i]) placeRadialMarker(mapMarks[i], landmarks[i].center, discoveredLandmarks.has(landmarks[i].id));
+      if (mapMarkWp) placeRadialMarker(mapMarkWp, waypoint != null ? columns[waypoint].center : null, waypoint != null);
+    }
+    // click the mini-globe → raycast onto the merged mesh → flag the nearest column as the waypoint
+    // (clicking near the existing waypoint clears it). The map inset and `mapFrame` share screen rect.
+    const _mapRay = new THREE.Raycaster(), _mapNDC = new THREE.Vector2();
+    function setWaypointAt(clientX, clientY) {
+      if (!mapMesh || !mapCam) return;
+      const rect = mapFrame.getBoundingClientRect();
+      _mapNDC.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+      _mapRay.setFromCamera(_mapNDC, mapCam);
+      const hit = _mapRay.intersectObject(mapMesh, false)[0];
+      if (!hit) return;                                  // clicked outside the globe silhouette
+      const col = nearestColumn(hit.point.x, hit.point.y, hit.point.z);
+      if (col < 0) return;
+      if (waypoint != null && Math.acos(Math.max(-1, Math.min(1, columns[waypoint].center.dot(columns[col].center)))) * R < R * 0.08) {
+        waypoint = null; showHint('📍 Waypoint cleared');                // tapped the flag again → clear
+      } else {
+        waypoint = col; showHint('📍 Waypoint set — follow the 📍 on your compass');
+      }
+      persist(); drawHud();
     }
 
     // ---- compass + landmark discovery (P1b) ----
@@ -444,6 +470,13 @@ export function mountEarth(task) {
         const dist = Math.round(Math.acos(Math.max(-1, Math.min(1, anchor.dot(lm.center)))) * R);
         html += tick(rel, `${lm.kind === 'water' ? '💧' : '🏔️'} ${dist}m`, 'cmp-lm');
       }
+      if (waypoint != null) {                                       // the player's flagged destination
+        const wdir = columns[waypoint].center, rel = wrapPi(bearingOf(wdir) - heading);
+        if (Math.abs(rel) < HALF_FOV) {
+          const dist = Math.round(Math.acos(Math.max(-1, Math.min(1, anchor.dot(wdir)))) * R);
+          html += tick(rel, `📍 ${dist}m`, 'cmp-wp');
+        }
+      }
       compass.innerHTML = html;
     }
     function discoverLandmarks() {
@@ -455,6 +488,25 @@ export function mountEarth(task) {
         if (pchunk === lm.chunk || chunkScanArr[lm.chunk].includes(pchunk)) {
           discoveredLandmarks.add(lm.id); showHint(`🏁 Discovered: ${lm.name}`); persist(); drawHud();
         }
+      }
+    }
+    // P1b-2: circumnavigation (net signed longitude around the polar axis → a ±2π loop is one lap) +
+    // waypoint arrival. Called each fly/walk frame; longitude is skipped near the poles (ill-defined there).
+    function updateJourney() {
+      if (Math.abs(anchor.y) < 0.985) {
+        const lon = Math.atan2(anchor.x, anchor.z);
+        if (lastLon != null) {
+          lapSigned += wrapPi(lon - lastLon);
+          if (Math.abs(lapSigned) >= 2 * Math.PI) {
+            lapSigned -= Math.sign(lapSigned) * 2 * Math.PI;
+            laps++; persist(); drawHud(); showHint(`🌍 You circumnavigated the planet! Lap ${laps}`);
+          }
+        }
+        lastLon = lon;
+      } else lastLon = null;
+      if (waypoint != null) {
+        const d = Math.acos(Math.max(-1, Math.min(1, anchor.dot(columns[waypoint].center)))) * R;
+        if (d < 5) { waypoint = null; persist(); drawHud(); showHint('📍 Reached your waypoint!'); }
       }
     }
     function toggleMap(force) {
@@ -619,6 +671,8 @@ export function mountEarth(task) {
         `<span class="chip">✏️ ${edits.size}</span>` +
         `<span class="chip">🧭 ${discoveredLandmarks.size}/${landmarks.length}</span>` +
         `<span class="chip">🗺️ ${discoveryPct()}%</span>` +
+        (waypoint != null ? `<span class="chip">📍</span>` : '') +
+        (laps ? `<span class="chip">🌍 ${laps}</span>` : '') +
         `<span class="chip">${mode}</span>`;
     }
     // belt = the 4 held items (block + pickaxe/shovel/axe) + a "Materials" button to choose the block.
@@ -782,15 +836,16 @@ export function mountEarth(task) {
     });
     on(window, 'pointerup', () => { dragging = false; renderer.domElement.style.cursor = 'grab'; });
     // map: drag the panel to spin the mini-globe (handlers on the frame, which captures pointer events)
-    let mapDrag = false, mapLX = 0, mapLY = 0;
-    on(mapFrame, 'pointerdown', (e) => { mapDrag = true; mapLX = e.clientX; mapLY = e.clientY; mapFrame.setPointerCapture?.(e.pointerId); });
+    let mapDrag = false, mapLX = 0, mapLY = 0, mapMoved = 0;
+    on(mapFrame, 'pointerdown', (e) => { mapDrag = true; mapLX = e.clientX; mapLY = e.clientY; mapMoved = 0; mapFrame.setPointerCapture?.(e.pointerId); });
     on(mapFrame, 'pointermove', (e) => {
       if (!mapDrag) return;
+      mapMoved += Math.abs(e.clientX - mapLX) + Math.abs(e.clientY - mapLY);
       mapTheta -= (e.clientX - mapLX) * 0.006;
       mapPhi = Math.max(0.12, Math.min(Math.PI - 0.12, mapPhi - (e.clientY - mapLY) * 0.006));
       mapLX = e.clientX; mapLY = e.clientY;
     });
-    on(mapFrame, 'pointerup', () => { mapDrag = false; });
+    on(mapFrame, 'pointerup', (e) => { mapDrag = false; if (mapMoved < 6) setWaypointAt(e.clientX, e.clientY); });   // a click (not a drag) flags/clears a waypoint
     on(renderer.domElement, 'pointermove', (e) => {
       if (mapOpen || camMode === 'walk' || !dragging) return;   // walk uses pointer-lock mouse-look instead
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
@@ -994,6 +1049,7 @@ export function mountEarth(task) {
           if (discoNew >= DISCO_SAVE_EVERY) { persist(); discoNew = 0; }
         }
         discoverLandmarks();
+        updateJourney();
       }
       if (planet) updateCompass();
 
@@ -1067,7 +1123,9 @@ export function mountEarth(task) {
         get anchor() { return { x: +anchor.x.toFixed(4), y: +anchor.y.toFixed(4), z: +anchor.z.toFixed(4) }; },
         get spawnTopMat() { const id = nearestColumn(anchor.x, anchor.y, anchor.z); return id < 0 ? -1 : store.getMat(id, store.getTop(id)); },
         get landmarks() { return landmarks.map((l) => ({ kind: l.kind, name: l.name, colId: l.colId, aboveSea: l.aboveSea, chunk: l.chunk })); },
-        get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); } };
+        get discoveredLandmarks() { return discoveredLandmarks.size; }, get heading() { return +(bearingOf(fwd) * 180 / Math.PI).toFixed(1); },
+        get waypoint() { return waypoint; }, get laps() { return laps; }, get lapSigned() { return +lapSigned.toFixed(3); },
+        setWaypoint(c) { waypoint = c; persist(); drawHud(); }, stepJourney() { updateJourney(); } };
       console.log('[earth] hex planet:', window.__earthDebug);
       overlay.remove();
       if (worker) { worker.terminate(); worker = null; }   // its job is finished; fine chunks mesh on demand
@@ -1114,6 +1172,7 @@ export function mountEarth(task) {
       if (planet) persist();                               // flush discovered regions before teardown
       if (mapMesh) { mapMesh.geometry.dispose(); mapMesh.material.dispose(); }
       if (mapMarkPlayer) { mapMarkPlayer.geometry.dispose(); mapMarkPlayer.material.dispose(); }
+      if (mapMarkWp) { mapMarkWp.geometry.dispose(); mapMarkWp.material.dispose(); }
       for (const m of mapMarks) { m.geometry.dispose(); m.material.dispose(); }
       for (const c of heldGroup.children) { c.geometry.dispose(); c.material.dispose(); }
       renderer.dispose();

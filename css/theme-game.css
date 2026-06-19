@@ -465,6 +465,7 @@ body.earth-wide #app { max-width: none; }
 }
 .earth-compass .cmp-card { color: #cbd5e1; }
 .earth-compass .cmp-lm { color: #ffe6a3; font-size: 0.74rem; }
+.earth-compass .cmp-wp { color: #ff8fe0; font-size: 0.76rem; text-shadow: 0 0 6px rgba(255,77,210,0.6); }
 
 .earth-loading {
   position: absolute; inset: 0; z-index: 4;
