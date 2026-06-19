@@ -194,6 +194,40 @@ export function mountEarth(task) {
     const sky = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.22, 48, 32), skyMat);
     sky.frustumCulled = false; scene.add(sky);
 
+    // ---- clouds (A2): a thin shell above the terrain, patchy procedural fbm cover that drifts slowly and is
+    // geographically fixed (sampled from the world direction, so it doesn't swim as you walk). Lit day→night
+    // by the shared sun. DoubleSide so it reads from the ground (underside overhead) and from orbit (tops). ----
+    const cloudU = { uSunDir: atmU.uSunDir, uTime: { value: 0 } };   // uSunDir shares the live sun vector
+    const cloudMat = new THREE.ShaderMaterial({
+      uniforms: cloudU,
+      vertexShader: SKY_VERT,
+      fragmentShader: `
+        uniform vec3 uSunDir; uniform float uTime; varying vec3 vPosW;
+        float hash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+        float vnoise(vec3 x){ vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                         mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                     mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                         mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z); }
+        float fbm(vec3 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 5; i++){ s += a * vnoise(p); p *= 2.03; a *= 0.5; } return s; }
+        void main(){
+          vec3 n = normalize(vPosW);
+          float f = fbm(n * 3.2 + vec3(uTime * 0.010, uTime * 0.004, uTime * 0.007));   // slow geographic drift
+          float cover = smoothstep(0.47, 0.68, f);                  // patchy deck; raise the lo toward 0.55 for less cover
+          if (cover < 0.01) discard;
+          vec3 sd = normalize(uSunDir);
+          float lit = clamp(dot(n, sd) * 0.5 + 0.5, 0.0, 1.0);      // 0 night side .. 1 noon side
+          float warm = clamp(1.0 - abs(dot(n, sd)) * 2.5, 0.0, 1.0); // warm near the terminator (sunrise/sunset)
+          vec3 day = mix(vec3(0.62, 0.66, 0.74), vec3(1.0), lit);   // shadowed base -> bright top
+          day = mix(day, vec3(1.0, 0.74, 0.52), warm * 0.5);        // golden edges at low sun
+          vec3 col = mix(vec3(0.06, 0.08, 0.13), day, clamp(lit * 1.4 + 0.08, 0.0, 1.0));   // dim on the dark side
+          gl_FragColor = vec4(col, cover * 0.9);
+        }`,
+      side: THREE.DoubleSide, transparent: true, depthWrite: false,
+    });
+    const clouds = new THREE.Mesh(new THREE.SphereGeometry(MAX_R * 1.05, 48, 32), cloudMat);
+    clouds.frustumCulled = false; clouds.renderOrder = 1; scene.add(clouds);
+
     // ---- world data (streamed from the worker's `topology` message; see the worker block below) ----
     // Declared up-front so input / camera / targeting / render close over them. They stay null/0 until
     // generation streams in, and every reader is null-safe until then (chunkCount 0 → nearestColumn=-1).
@@ -1112,6 +1146,7 @@ export function mountEarth(task) {
       atmU.uSky.value = camMode === 'orbit' ? 0 : 1;       // sky only near the surface; pure space in orbit
       scene.fog.density = camMode === 'orbit' ? 0 : FOG_DENSITY;   // no haze from space (would hide the planet)
       planet.waterUniforms.uTime.value += dt;              // animate the water surface (uSunDir is shared/live)
+      cloudU.uTime.value += dt;                            // drift the cloud cover
       shadowAcc += dt;                                     // refresh shadows on edits + ~3×/sec (not every frame)
       if (shadowDirty || shadowAcc >= 0.35) { renderer.shadowMap.needsUpdate = true; shadowDirty = false; shadowAcc = 0; }
       if (cameraMoved() || needsTarget) { updateTargeting(); needsTarget = false; }
