@@ -1,76 +1,99 @@
-/* planet-worker.js — Earth world-generation worker (Engine E2).
+/* planet-worker.js — Earth ASYNC chunk gen+mesh service (Phase C "async world").
 
-   Runs the heavy, formerly-blocking generation OFF the main thread: topology (buildHexSphere) +
-   terrain (terrainFill, + any saved edits) + per-chunk meshing, then STREAMS the result to earth.js
-   as TRANSFERABLE buffers (zero-copy). The main thread stays responsive the whole time — it renders
-   the progress overlay and can even orbit while the world streams in.
+   The Phase-C cutover streams a PlanetSmith-scale planet by generating + meshing one sub-region CHUNK at a
+   time. Doing that synchronously on the render thread froze the game (multi-second gen per chunk at FREQ 290).
+   This worker moves GENERATION + MESHING off-thread: the main thread keeps a small resident store of already-
+   delivered chunks and reads it synchronously (physics/picking), while this worker generates ahead-of-need and
+   ships finished chunks back as TRANSFERABLE buffers (zero-copy). Chunks "pop in" — the loop never blocks.
 
    Protocol:
-     main → worker : { type:'init', freq, seed, edits:[{c,m}] }
-     worker → main : { type:'topology', centers, boundary, boundaryLen, neighbors, chunk, cells,
-                       chunkCount, pentagonCount, river }              (one message, transferables)
-                     { type:'chunk', chunkId, sPos, sCol, wPos, wCol, built, total }  (one per chunk)
-                     { type:'done' }
+     main → worker : { type:'init',    freq, seed, S, edits:[{ci,m,st}] }
+                     { type:'request', chunkKeys:[..], priority?:bool }   (queue chunks to gen+mesh)
+                     { type:'release', chunkKeys:[..] }                   (drop queued/far chunks)
+                     { type:'edit',    edits:[{ci,m,st}] }                (bake a player edit into future gen)
+     worker → main : { type:'ready' }
+                     { type:'chunk', chunkKey, empty?, cells, sPos,sCol,sTile, wPos,wCol }  (one per chunk, transferables)
 
-   This is a MODULE worker (`{type:'module'}`), so it can `import` the same ES modules the page uses. */
+   This is a MODULE worker (`{type:'module'}`) so it `import`s the same engine modules the page uses. The mesher
+   (meshChunkArrays) is worker-safe: it emits geometry arrays + tile ids only — the texture atlas / materials
+   stay on the main thread. */
 
-import { buildHexSphere } from './hexsphere.js';
-import { terrainFill, meshSurfaceSkin, terrainMeta } from './planet-mesh.js';
-import { FREQ_COARSE } from '../../data/planet.js';
+import { LAYERS } from '../../data/planet.js';
+import { meshChunkArrays } from './planet-mesh.js';
+import { StreamWorld } from './planet-stream.js';
+import { chunkColumnObjects } from './planet-region.js';
+import { chunkOf, decodeId } from './icosphere-address.js';
+
+let world = null;             // worker-side StreamWorld (ChunkCache + edit baking + getMat for meshing)
+let f = 0, S = 0;
+const queue = [];             // chunkKeys waiting to be generated + meshed (FIFO; priority unshifts)
+const queued = new Set();     // membership of `queue` (dedupe)
+let pumping = false;
 
 self.onmessage = (e) => {
-  const msg = e.data;
-  if (!msg || msg.type !== 'init') return;
-  const { freq, seed, edits } = msg;
-
-  // 1. topology + terrain (+ saved edits) — the work that used to freeze the page, now off-thread
-  const { columns, pentagonCount, chunkCount } = buildHexSphere(freq);
-  const cells = terrainFill(columns, seed);
-  const river = terrainMeta.river;                  // capture before the coarse globe's terrainFill clears it
-  if (Array.isArray(edits)) {
-    for (const ed of edits) if (ed && ed.c >= 0 && ed.c < cells.length) cells[ed.c] = ed.m;
-  }
-
-  // 2. flatten columns → typed arrays for the main thread's picking / highlight / ghost.
-  //    boundary/neighbours padded to 6 per column (pentagons use 5; the 6th stays unused / -1).
-  const N = columns.length;
-  const centers = new Float32Array(N * 3);
-  const boundary = new Float32Array(N * 6 * 3);
-  const boundaryLen = new Uint8Array(N);
-  const neighbors = new Int32Array(N * 6).fill(-1);
-  const chunk = new Uint16Array(N);
-  for (let i = 0; i < N; i++) {
-    const col = columns[i], c = col.center;
-    centers[i * 3] = c.x; centers[i * 3 + 1] = c.y; centers[i * 3 + 2] = c.z;
-    chunk[i] = col.chunk;
-    const bl = col.boundary.length;
-    boundaryLen[i] = bl;
-    for (let k = 0; k < bl; k++) {
-      const b = col.boundary[k], o = (i * 6 + k) * 3;
-      boundary[o] = b.x; boundary[o + 1] = b.y; boundary[o + 2] = b.z;
-      neighbors[i * 6 + k] = col.neighbors[k];
+  const msg = e.data; if (!msg) return;
+  switch (msg.type) {
+    case 'init': {
+      f = msg.freq; S = msg.S;
+      const edits = new Map(), editStates = new Map();
+      if (Array.isArray(msg.edits)) for (const ed of msg.edits) { edits.set(ed.ci, ed.m); if (ed.st) editStates.set(ed.ci, ed.st); }
+      world = new StreamWorld(msg.freq, msg.seed, msg.S, edits, editStates);
+      self.postMessage({ type: 'ready' });
+      break;
+    }
+    case 'request': {
+      const keys = msg.chunkKeys || [];
+      if (msg.priority) { for (let i = keys.length - 1; i >= 0; i--) { const k = keys[i]; if (!queued.has(k)) { queued.add(k); queue.unshift(k); } } }
+      else { for (const k of keys) if (!queued.has(k)) { queued.add(k); queue.push(k); } }
+      if (!pumping) { pumping = true; pump(); }
+      break;
+    }
+    case 'release': {
+      for (const k of (msg.chunkKeys || [])) queued.delete(k);   // pump() skips keys no longer queued
+      break;
+    }
+    case 'edit': {
+      if (Array.isArray(msg.edits)) for (const ed of msg.edits) applyEdit(ed.ci, ed.m, ed.st || 0);
+      break;
     }
   }
-  // transfer the full cells grid (the main thread keeps it resident for picking + on-demand meshing).
-  // Safe to transfer the original: the coarse globe below uses its OWN low-FREQ cells, not this one.
-  self.postMessage(
-    { type: 'topology', centers, boundary, boundaryLen, neighbors, chunk, cells, chunkCount, pentagonCount, river },
-    [centers.buffer, boundary.buffer, boundaryLen.buffer, neighbors.buffer, chunk.buffer, cells.buffer],
-  );
-
-  // 3. coarse LOD globe: a low-FREQ surface skin of the whole planet (same seed → continents/biomes
-  //    line up), built PER CHUNK using the same chunk regions as the fine world (chunkCount is the same,
-  //    independent of FREQ). The main thread hides a coarse chunk exactly when its fine chunk streams in
-  //    (no overlap → no poke-through), and meshes fine hexel chunks on demand near the camera.
-  const cg = buildHexSphere(FREQ_COARSE);
-  const ccells = terrainFill(cg.columns, seed);
-  const cgroups = Array.from({ length: cg.chunkCount }, () => []);
-  for (const col of cg.columns) cgroups[col.chunk].push(col);
-  const cpos = [], ccol = [], xfer = [];
-  for (let i = 0; i < cg.chunkCount; i++) {
-    const s = meshSurfaceSkin(cgroups[i], ccells);
-    cpos.push(s.pos); ccol.push(s.col); xfer.push(s.pos.buffer, s.col.buffer);
-  }
-  self.postMessage({ type: 'coarse', chunkCount: cg.chunkCount, pos: cpos, col: ccol }, xfer);
-  self.postMessage({ type: 'done' });
 };
+
+// record a player edit so the worker bakes it into any (re)generation of that chunk, and patch the cached
+// chunk in place if it's already resident (so a later re-ship of the same chunk is correct after eviction).
+function applyEdit(ci, m, st) {
+  if (!world) return;
+  world._indexEdit(ci, m);
+  const id = Math.floor(ci / LAYERS), L = ci - id * LAYERS;
+  world.setState(id, L, st);
+  const ck = chunkOf(decodeId(id, f), f, S), ce = world.cache.map.get(ck);
+  if (ce) { const lc = ce.data.idToLocal.get(id); if (lc !== undefined) ce.data.cells[lc * LAYERS + L] = m; }
+}
+
+// process ONE chunk per macrotask, yielding via setTimeout(0) between chunks so incoming messages
+// (priority requests, releases, edits) interleave — the worker never blocks its own message queue.
+function pump() {
+  // skip released keys
+  while (queue.length && !queued.has(queue[0])) queue.shift();
+  if (!queue.length) { pumping = false; return; }
+  const k = queue.shift(); queued.delete(k);
+  try {
+    const cols = chunkColumnObjects(k, f, S);
+    if (!cols.length) { self.postMessage({ type: 'chunk', chunkKey: k, empty: true }); }
+    else {
+      const mesh = meshChunkArrays(cols, world);                 // world bakes edits + generates neighbours for culling
+      const data = world._chunk(k);                              // edit-baked cells of chunk k
+      const cells = data.cells.slice();                          // copy so the worker's cache stays intact after transfer
+      self.postMessage(
+        { type: 'chunk', chunkKey: k, cells, sPos: mesh.sPos, sCol: mesh.sCol, sTile: mesh.sTile, wPos: mesh.wPos, wCol: mesh.wCol },
+        [cells.buffer, mesh.sPos.buffer, mesh.sCol.buffer, mesh.sTile.buffer, mesh.wPos.buffer, mesh.wCol.buffer],
+      );
+    }
+  } catch (err) {
+    // report as an ERROR (not empty) so the main thread retries it rather than caching a permanent hole.
+    const detail = String(err && err.stack || err);
+    console.error('[planet-worker] chunk gen failed', k, detail);
+    self.postMessage({ type: 'chunk', chunkKey: k, error: detail });
+  }
+  setTimeout(pump, 0);
+}
