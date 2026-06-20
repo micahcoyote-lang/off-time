@@ -345,3 +345,69 @@ export function chunksWithin(anchor, f, S, radiusCols) {
   }
   return chunks;
 }
+
+// ---- FAST chunk proximity (async-world streaming): precomputed chunk-centroid disc query ----
+// chunksWithin above does a per-column BFS — ~1.7s/call at f=290, far too slow to run on chunk-change in the
+// render loop. Instead precompute every chunk's representative centre ONCE per (f,S), then a chunk-change query
+// is a single dot-product sweep over the ~few-thousand chunk centroids (<1ms at f=290). The nearest centroid is
+// also the chunk under the anchor, so the streamer needs no addressOf per frame.
+
+// representative unit centre of a chunk (a mid column of its block) — no per-column build, just one centerOf.
+function chunkRepCenter(chunkKey, f, S) {
+  const region = Math.floor(chunkKey / CHUNK_MUL), sub = chunkKey - region * CHUNK_MUL;
+  if (region < REGION_EDGE) return ICO[region];
+  if (region < REGION_FACE) {
+    const lo = sub * S, hi = Math.min(f - 2, (sub + 1) * S - 1);
+    if (hi < lo) return null;
+    const e = EDGES[region - REGION_EDGE], m = ((lo + hi) >> 1) + 1;          // local→step m = local+1
+    return slerp(ICO[e.u], ICO[e.v], m / f);
+  }
+  const F = region - REGION_FACE, GB = Math.ceil((f + 1) / S), gi = Math.floor(sub / GB), gj = sub - gi * GB;
+  const iLo = Math.max(2, gi * S), iHi = Math.min(f - 1, (gi + 1) * S - 1);
+  if (iHi < iLo) return null;
+  const mid = (iLo + iHi) >> 1;
+  for (let off = 0; off <= iHi - iLo; off++) {                                // first row in the block with a valid j range
+    for (const i of (off === 0 ? [mid] : [mid + off, mid - off])) {
+      if (i < iLo || i > iHi) continue;
+      const jLo = Math.max(1, gj * S), jHi = Math.min(i - 1, (gj + 1) * S - 1);
+      if (jHi >= jLo) return faceLatticePos(F, i, (jLo + jHi) >> 1, f);
+    }
+  }
+  return null;
+}
+// enumerate every (potentially non-empty) chunk key at (f,S).
+function enumerateChunkKeys(f, S) {
+  const keys = [];
+  for (let r = 0; r < REGION_EDGE; r++) keys.push(r * CHUNK_MUL);
+  const segs = Math.ceil((f - 1) / S);
+  for (let r = REGION_EDGE; r < REGION_FACE; r++) for (let s = 0; s < segs; s++) keys.push(r * CHUNK_MUL + s);
+  const GB = Math.ceil((f + 1) / S), giMax = Math.floor((f - 1) / S);
+  for (let r = REGION_FACE; r < REGION_COUNT; r++)
+    for (let gi = 0; gi <= giMax; gi++) for (let gj = 0; gj <= gi; gj++) keys.push(r * CHUNK_MUL + gi * GB + gj);
+  return keys;
+}
+// cached centroid table per (f,S): parallel arrays of keys + unit centres.
+const _centroidCache = new Map();
+export function chunkCentroids(f, S) {
+  const ck = f + ',' + S; let c = _centroidCache.get(ck); if (c) return c;
+  const keys = [], xs = [], ys = [], zs = [];
+  for (const k of enumerateChunkKeys(f, S)) { const p = chunkRepCenter(k, f, S); if (!p) continue; keys.push(k); xs.push(p.x); ys.push(p.y); zs.push(p.z); }
+  c = { keys, cx: Float32Array.from(xs), cy: Float32Array.from(ys), cz: Float32Array.from(zs) };
+  _centroidCache.set(ck, c); return c;
+}
+// the chunks whose centre lies within ~radiusCols columns of the unit anchor, plus the nearest chunk (= the
+// chunk under the anchor). `anchor` must be a unit vector. O(#chunks) dot-products — the fast path.
+export function chunksNear(anchor, f, S, radiusCols) {
+  const { keys, cx, cy, cz } = chunkCentroids(f, S);
+  const colStep = Math.sqrt((4 * Math.PI) / (10 * f * f));        // mean angular spacing between columns
+  const ang = Math.min(Math.PI, radiusCols * colStep + S * colStep * 0.8);   // disc radius + a chunk-size margin
+  const cosA = Math.cos(ang), ax = anchor.x, ay = anchor.y, az = anchor.z;
+  const chunks = new Set(); let best = -1, bd = -2;
+  for (let i = 0; i < keys.length; i++) {
+    const d = cx[i] * ax + cy[i] * ay + cz[i] * az;
+    if (d > bd) { bd = d; best = keys[i]; }
+    if (d >= cosA) chunks.add(keys[i]);
+  }
+  if (best >= 0) chunks.add(best);
+  return { chunks, current: best };
+}

@@ -29,8 +29,8 @@
 </div>
 <script type="module">
 import * as THREE from './assets/vendor/three.module.js';
-import { makeSolidMaterial } from './js/games/planet-mesh.js';
-import { ChunkStreamer, StreamWorld } from './js/games/planet-stream.js';
+import { makeSolidMaterial, makeWaterMaterial } from './js/games/planet-mesh.js';
+import { AsyncWorld } from './js/games/planet-stream.js';
 import { addressOf } from './js/games/icosphere-address.js';
 import { genColumns } from './js/games/planet-region.js';
 import { MAX_R, R, radius, SEA_L } from './data/planet.js';
@@ -51,7 +51,7 @@ scene.add(new THREE.HemisphereLight(0xcfe7ff, 0x33414f, 0.7));
 scene.add(new THREE.AmbientLight(0xffffff, 0.25));
 
 const solidMat = makeSolidMaterial();
-const waterMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.62, depthWrite: false });
+const { material: waterMat, uniforms: waterU } = makeWaterMaterial(sunDir);
 
 const statsEl = document.getElementById('stats');
 const yawDir = new THREE.Vector3(1, 0, 0);   // forward tangent (world); kept perpendicular to the radial up
@@ -63,9 +63,9 @@ function start() {
   const f = Math.max(32, Math.min(2000, parseInt(document.getElementById('freq').value) || 200));
   const S = Math.max(8, Math.min(64, parseInt(document.getElementById('csize').value) || 24));
   const seed = parseInt(document.getElementById('seed').value) | 0;
-  const world = new StreamWorld(f, seed, S);
-  streamer = new ChunkStreamer({ scene, world, solidMat, waterMat, radiusCols: 3 * S });
+  streamer = new AsyncWorld({ scene, freq: f, seed, S, solidMat, waterMat, radiusCols: 2.5 * S });
   streamer._f = f; streamer._S = S;
+  window.__rt = { get streamer() { return streamer; }, scene, camera, anchor };
   // place the camera just above the terrain at (0,0,1), looking along the local tangent
   const startDir = new THREE.Vector3(0, 0, 1);
   const surfR = surfaceRadiusAt(startDir, f, seed);
@@ -116,7 +116,8 @@ function frame() {
   camera.up.copy(upW); camera.lookAt(camera.position.clone().add(fwd));
 
   let info = null;
-  if (streamer) { anchor.copy(camera.position).normalize(); info = streamer.update(anchor, 6); }
+  if (streamer) { anchor.copy(camera.position).normalize(); info = streamer.update(anchor); }
+  waterU.uTime.value += dt;
   renderer.render(scene, camera);
 
   acc += dt; frames++;
