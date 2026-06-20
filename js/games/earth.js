@@ -825,7 +825,12 @@ export function mountEarth(task) {
     // ground-surface radius from the PURE per-column height function (columnGen) — needs no streamed chunk, so
     // landmark signposts + far map markers get a correct radius even before/without their fine chunks resident.
     let _landFbm = null;
-    function surfaceRadiusPure(v) { if (!_landFbm) _landFbm = makeNoise(seed); return radius(columnGen(_landFbm, v).s + 1); }
+    const _pureFbm = () => (_landFbm || (_landFbm = makeNoise(seed)));
+    function surfaceRadiusPure(v) { return radius(columnGen(_pureFbm(), v).s + 1); }
+    // analytic ground (no streamed chunk needed): the pure per-column surface + water flood. Used as the floor
+    // wherever the fine chunk hasn't arrived yet, so the player walks on the real-shaped terrain immediately and
+    // the streamed cells just refine it (caves/edits/trees) when they pop in — walking never blocks on streaming.
+    function pureGround(v) { const g = columnGen(_pureFbm(), v); return { solidR: radius(g.s + 1), waterTopR: g.s < SEA_L ? radius(SEA_L + 1) : 0, headroom: true }; }
     // The floor under the player at direction `v`, given their current feet radius `fromR`. Finds the
     // highest solid (non-water) cell AT OR JUST BELOW the step-up ceiling — so you can stand INSIDE a
     // pit / tunnel / cave (a floor below the surface) instead of being snapped up to the topmost
@@ -834,9 +839,9 @@ export function mountEarth(task) {
     function groundInfo(v, fromR) {
       if (!fw) return { solidR: radius(SEA_L), waterTopR: 0, headroom: true };
       const best = fnear(v.x, v.y, v.z);
-      // (Phase C async world) the chunk under the feet hasn't streamed in yet → HOLD: report the current feet
-      // radius as the floor (no fall, no step) and flag it so a walk into the void is blocked. Resumes on arrival.
-      if (!fw.loaded(best)) return { solidR: fromR, waterTopR: 0, headroom: true, unloaded: true };
+      // (Phase C async world) the chunk under the feet hasn't streamed in yet → stand on the ANALYTIC surface so
+      // the player can always walk; the streamed cells refine it (caves/trees/edits) once they arrive.
+      if (!fw.loaded(best)) return pureGround(v);
       const Lf = Math.max(0, Math.floor((fromR - radius(0)) / TH));
       const ceilL = Math.min(LAYERS - 1, Lf + STEP_LAYERS);
       let floorL = -1, waterTopR = 0;
@@ -1068,8 +1073,7 @@ export function mountEarth(task) {
       moveOnSphere(dir, dθ);
       if (grounded) {
         const g = groundInfo(anchor, feetR);               // floor below the feet (not the topmost surface)
-        // revert on a wall, no head clearance, or terrain that hasn't streamed in yet (don't walk into the void)
-        if (g.unloaded || !g.headroom || g.solidR - feetR > STEP_UP) { anchor.copy(_sa); fwd.copy(_sf); }
+        if (!g.headroom || g.solidR - feetR > STEP_UP) { anchor.copy(_sa); fwd.copy(_sf); }   // wall or no head clearance
       }
     }
     function frame(t) {
